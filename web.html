@@ -1,0 +1,815 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP Claw</title>
+<style>
+:root{
+  color-scheme:light;
+  --bg:#f3f5f8;
+  --page:#f7f9fc;
+  --surface:#ffffff;
+  --surface-2:#ffffff;
+  --surface-3:#eef2f7;
+  --input:#ffffff;
+  --text:#182230;
+  --muted:#667085;
+  --dim:#98a2b3;
+  --line:rgba(16,24,40,.12);
+  --line-strong:rgba(16,24,40,.24);
+  --accent:#d92d20;
+  --accent-soft:#b42318;
+  --accent-dim:rgba(217,45,32,.08);
+  --orange:#b54708;
+  --red:#d92d20;
+  --green:#16803c;
+  --green-dim:rgba(22,128,60,.12);
+  --shadow:0 16px 40px rgba(16,24,40,.08);
+  --radius:10px;
+  --radius-lg:16px;
+  font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+}
+*{box-sizing:border-box}
+html{background:var(--bg)}
+body{margin:0;min-height:100dvh;background:var(--page);color:var(--text);font-size:16px;line-height:1.55;overflow-x:hidden}
+button,input,textarea{font:inherit}
+button{min-height:40px;border:1px solid var(--line);border-radius:var(--radius);background:var(--surface-2);color:var(--text);padding:0 13px;cursor:pointer;transition:border-color .15s,background .15s,color .15s,transform .15s}
+button:hover{background:var(--surface-3);border-color:var(--line-strong)}
+button:active{transform:translateY(1px)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.primary:hover{background:var(--accent-soft);border-color:var(--accent-soft)}
+button.danger{color:var(--red)}
+button:disabled{opacity:.55;cursor:not-allowed}
+button:focus-visible,input:focus-visible,textarea:focus-visible{outline:3px solid rgba(217,45,32,.22);outline-offset:2px}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:rgba(16,24,40,.18);border-radius:999px}
+.shell{min-height:100dvh;display:grid;grid-template-columns:292px minmax(0,1fr);grid-template-areas:"side main";gap:0;max-width:none;margin:0}
+.main{grid-area:main;min-width:0;width:min(1120px,100%);margin:0 auto;padding:18px;display:flex;flex-direction:column;gap:14px}
+.side{grid-area:side;position:sticky;top:0;height:100dvh;overflow:auto;display:flex;flex-direction:column;gap:12px;padding:14px;background:rgba(255,255,255,.92);border-right:1px solid var(--line)}
+.panel{background:var(--surface-2);border:1px solid var(--line);border-radius:var(--radius-lg);box-shadow:var(--shadow)}
+.top{position:sticky;top:0;z-index:3;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;background:rgba(255,255,255,.94);backdrop-filter:blur(12px)}
+h1{font-size:1.15rem;line-height:1.2;margin:0;font-weight:700}
+.brand{padding:12px;display:grid;grid-template-columns:42px minmax(0,1fr);gap:10px;align-items:center;background:transparent;box-shadow:none}
+.brand-mark{width:42px;height:42px;border-radius:12px;display:grid;place-items:center;background:var(--accent);color:#fff;font-weight:800}
+.brand-title{font-weight:750;line-height:1.1}
+.brand-sub{font-size:.78rem;color:var(--muted);margin-top:3px}
+.status{display:flex;gap:8px;align-items:center;color:var(--muted);font-size:.88rem}
+.dot{width:9px;height:9px;border-radius:99px;background:var(--green)}
+.dot.busy{background:var(--orange)}
+.dot.warn{background:var(--red)}
+.chat{display:flex;flex-direction:column;height:min(620px,calc(100dvh - 190px));min-height:430px}
+.messages{flex:1;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
+.msg{max-width:78%;padding:10px 12px;border-radius:var(--radius);border:1px solid var(--line);white-space:pre-wrap;word-break:break-word;background:var(--surface)}
+.msg.user{align-self:flex-end;background:var(--accent-dim);border-color:rgba(217,45,32,.26)}
+.msg.assistant{align-self:flex-start;background:var(--surface);border-color:var(--line)}
+.composer{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;border-top:1px solid var(--line);padding:12px;background:var(--surface)}
+textarea{width:100%;min-height:54px;max-height:170px;resize:vertical;border:1px solid var(--line);border-radius:var(--radius);padding:10px 12px;color:var(--text);background:var(--input)}
+.section{padding:14px 16px;display:flex;flex-direction:column;gap:10px}
+.section h2{font-size:.82rem;letter-spacing:0;text-transform:uppercase;color:var(--muted);margin:0;font-weight:700}
+.grid{display:grid;grid-template-columns:1fr;gap:10px}
+label{display:flex;flex-direction:column;gap:5px;color:var(--muted);font-size:.8rem;font-weight:500}
+input{width:100%;height:40px;border:1px solid var(--line);border-radius:var(--radius);padding:0 10px;color:var(--text);background:var(--input)}
+input[type=checkbox]{width:22px;height:22px}
+label.inline{flex-direction:row;align-items:center;justify-content:space-between}
+.row{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+.pill{display:inline-flex;align-items:center;min-height:30px;padding:3px 9px;border-radius:999px;background:rgba(16,24,40,.04);border:1px solid var(--line);color:var(--muted);font-size:.8rem}
+.qrbox{border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);padding:10px;display:flex;flex-direction:column;gap:9px}
+.qr-actions{display:flex;gap:8px;flex-wrap:wrap}
+.qr-actions button{min-height:36px;padding:0 10px}
+.qrstage{height:224px;display:flex;align-items:center;justify-content:center;background:var(--input);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
+.qrstage img,.qrstage canvas{width:220px;height:220px;object-fit:contain;image-rendering:pixelated}
+.qrstage .empty{color:var(--muted);font-size:.88rem}
+.link{color:var(--accent-soft);font-size:.82rem;text-decoration:none;word-break:break-word}
+.link:hover{text-decoration:underline}
+.logs{display:flex;flex-direction:column;gap:6px;max-height:220px;overflow:auto}
+.log{font-size:.82rem;color:var(--muted);border-top:1px solid var(--line);padding-top:6px}
+.error{color:var(--red);font-size:.9rem;min-height:1.4em}
+.small{color:var(--muted);font-size:.82rem}
+.workbench{min-height:360px}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;border-bottom:1px solid var(--line);padding:10px 12px 0;background:var(--surface)}
+.tab{min-height:36px;border-bottom-left-radius:0;border-bottom-right-radius:0;background:transparent;color:var(--muted)}
+.tab.active{background:var(--accent-dim);border-color:rgba(217,45,32,.32);color:var(--text)}
+.view{display:none;padding:14px 16px}
+.view.active{display:block}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.stack{display:flex;flex-direction:column;gap:10px}
+.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.toolbar input{max-width:260px}
+pre{margin:0;white-space:pre-wrap;word-break:break-word;background:var(--input);border:1px solid var(--line);border-radius:var(--radius);padding:10px;max-height:260px;overflow:auto;font-size:.82rem;line-height:1.45;font-family:"JetBrains Mono","Fira Code","SFMono-Regular",Consolas,monospace;color:var(--text)}
+.list{display:flex;flex-direction:column;gap:8px;max-height:330px;overflow:auto}
+.item{border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);padding:9px;display:flex;flex-direction:column;gap:6px}
+.item .meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:.78rem}
+.item.ok{border-color:rgba(22,128,60,.34)}
+.item.warn{border-color:rgba(181,71,8,.34)}
+.item.fail{border-color:rgba(217,45,32,.34)}
+.item p{margin:0}
+.item button{min-height:34px;padding:0 10px}
+.mini{font-size:.78rem;color:var(--muted)}
+.wide-text{min-height:92px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.84rem}
+@media (max-width:920px){
+  .shell{grid-template-columns:1fr;grid-template-areas:"main" "side"}
+  .main{padding:10px}
+  .side{position:static;height:auto;border-right:0;border-top:1px solid var(--line)}
+  .top{top:0}
+  .chat{height:calc(100dvh - 120px);min-height:390px}
+  .msg{max-width:92%}
+  .cols{grid-template-columns:1fr}
+  .toolbar input{max-width:none}
+}
+</style>
+</head>
+<body>
+<main class="shell">
+  <section class="main">
+    <div class="panel top">
+      <div>
+        <h1>ESP Claw</h1>
+        <div class="small" id="route">connecting</div>
+      </div>
+      <div class="status"><span id="dot" class="dot"></span><span id="statusText">ready</span></div>
+    </div>
+    <div class="panel chat">
+      <div id="messages" class="messages"></div>
+      <form id="composer" class="composer">
+        <textarea id="input" placeholder="Message"></textarea>
+        <button id="send" class="primary" type="submit">Send</button>
+      </form>
+    </div>
+    <div class="panel workbench">
+      <div class="tabs">
+        <button class="tab active" data-view="promptView" type="button">Prompt</button>
+        <button class="tab" data-view="memoryView" type="button">Memory</button>
+        <button class="tab" data-view="skillsView" type="button">Skills</button>
+        <button class="tab" data-view="panelView" type="button">Panel</button>
+        <button class="tab" data-view="checkView" type="button">Check</button>
+      </div>
+      <section id="promptView" class="view active">
+        <div class="stack">
+          <div class="toolbar">
+            <input id="previewInput" placeholder="Preview message">
+            <button id="previewRun" class="primary" type="button">Preview</button>
+          </div>
+          <div class="cols">
+            <div class="stack">
+              <label>Instructions<pre id="previewInstructions"></pre></label>
+              <label>Memory<pre id="previewMemory"></pre></label>
+            </div>
+            <div class="stack">
+              <label>Skills<pre id="previewSkills"></pre></label>
+              <label>History + Input<pre id="previewInputBlock"></pre></label>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section id="memoryView" class="view">
+        <div class="cols">
+          <div class="stack">
+            <div class="toolbar">
+              <input id="memoryQuery" placeholder="Search memory">
+              <button id="memorySearch" class="primary" type="button">Search</button>
+              <button id="memoryExport" type="button">Export</button>
+              <button id="memoryClearSession" type="button">Clear Session</button>
+            </div>
+            <div id="memoryList" class="list"></div>
+            <textarea id="memoryImportText" class="wide-text" placeholder="Paste exported memory JSON"></textarea>
+            <div class="toolbar">
+              <button id="memoryImportMerge" type="button">Import Merge</button>
+              <button id="memoryImportReplace" class="danger" type="button">Import Replace</button>
+            </div>
+          </div>
+          <div class="stack">
+            <label>Identity<textarea id="profileIdentity" class="wide-text"></textarea></label>
+            <label>User<textarea id="profileUser" class="wide-text"></textarea></label>
+            <label>Soul<textarea id="profileSoul" class="wide-text"></textarea></label>
+            <button id="profilesSave" class="primary" type="button">Save Profiles</button>
+          </div>
+        </div>
+      </section>
+      <section id="skillsView" class="view">
+        <div class="toolbar">
+          <button id="skillsRefresh" class="primary" type="button">Refresh</button>
+          <button id="skillsClear" type="button">Clear Active</button>
+        </div>
+        <div class="cols">
+          <div><div class="mini">Catalog</div><div id="skillsCatalog" class="list"></div></div>
+          <div><div class="mini">Active</div><div id="skillsActive" class="list"></div></div>
+        </div>
+      </section>
+      <section id="panelView" class="view">
+        <div class="toolbar">
+          <button id="panelRefresh" class="primary" type="button">Refresh</button>
+          <button id="panelClear" class="danger" type="button">Clear History</button>
+        </div>
+        <div class="cols">
+          <div id="panelHistory" class="list"></div>
+          <pre id="panelDetail"></pre>
+        </div>
+      </section>
+      <section id="checkView" class="view">
+        <div class="toolbar">
+          <button id="selfCheckRun" class="primary" type="button">Run Check</button>
+        </div>
+        <div id="selfCheckList" class="list"></div>
+      </section>
+    </div>
+    <div class="error" id="error"></div>
+  </section>
+  <aside class="side">
+    <div class="brand panel">
+      <div class="brand-mark">EC</div>
+      <div>
+        <div class="brand-title">ESP-Claw</div>
+        <div class="brand-sub">Web Config</div>
+      </div>
+    </div>
+    <div class="panel section">
+      <div class="row">
+        <h2>Runtime</h2>
+        <button id="reset" class="danger" type="button">Reset</button>
+      </div>
+      <div class="row">
+        <span class="pill" id="llmReady">LLM</span>
+        <span class="pill" id="wechatReady">WeChat</span>
+        <span class="pill" id="toolCount">Tools 0</span>
+      </div>
+    </div>
+    <form id="configForm" class="panel section">
+      <h2>LLM</h2>
+      <div class="grid">
+        <label>Base URL<input id="llm_base_url" autocomplete="off"></label>
+        <label>Model<input id="llm_model" autocomplete="off"></label>
+        <label>API Key<input id="llm_api_key" type="password" autocomplete="off" placeholder="keep existing"></label>
+        <label class="inline">Code thinking<input id="llm_thinking_enabled" type="checkbox"></label>
+        <label class="inline">Code only<input id="llm_thinking_for_code_only" type="checkbox"></label>
+        <label>Effort
+          <select id="llm_reasoning_effort">
+            <option value="high">High / fast</option>
+            <option value="max">Max / slower</option>
+          </select>
+        </label>
+      </div>
+      <h2>WeChat</h2>
+      <div class="qrbox">
+        <div class="row">
+          <span class="small" id="wechatQrStatus">Status: idle</span>
+          <div class="qr-actions">
+            <button id="wechatQrStart" type="button">Scan</button>
+            <button id="wechatQrCancel" type="button">Cancel</button>
+          </div>
+        </div>
+        <div class="qrstage" id="qrStage">
+          <span class="empty">No QR</span>
+        </div>
+        <a id="wechatQrLink" class="link" href="#" target="_blank" rel="noopener noreferrer" hidden>Open login link</a>
+      </div>
+      <div class="grid">
+        <label class="inline">Enabled<input id="wechat_enabled" type="checkbox"></label>
+        <label>Base URL<input id="wechat_base_url" autocomplete="off"></label>
+        <label>Token<input id="wechat_token" type="password" autocomplete="off" placeholder="keep existing"></label>
+      </div>
+      <button class="primary" type="submit">Save</button>
+    </form>
+    <div class="panel section">
+      <h2>Logs</h2>
+      <div id="logs" class="logs"></div>
+    </div>
+  </aside>
+</main>
+<script>
+const BASE="__BASE__";
+const $=id=>document.getElementById(id);
+const messages=[];
+const seenProgress=new Set();
+let progressReady=false;
+function showError(text){$("error").textContent=text||""}
+function addMsg(role,text){
+  messages.push({role,text});
+  const wrap=$("messages");
+  const el=document.createElement("div");
+  el.className="msg "+(role==="user"?"user":"assistant");
+  el.textContent=text;
+  wrap.appendChild(el);
+  wrap.scrollTop=wrap.scrollHeight;
+  return el;
+}
+function applyProgressLogs(logs){
+  const items=(logs||[]).filter(item=>item&&item.kind==="progress"&&item.text);
+  if(!progressReady){
+    items.forEach(item=>seenProgress.add(String(item.at||"")+"|"+item.text));
+    progressReady=true;
+    return;
+  }
+  items.slice().reverse().forEach(item=>{
+    const key=String(item.at||"")+"|"+item.text;
+    if(seenProgress.has(key))return;
+    seenProgress.add(key);
+    addMsg("assistant",item.text);
+  });
+}
+function sleepMs(ms){return new Promise(resolve=>setTimeout(resolve,ms))}
+async function api(action,payload,opts){
+  opts=opts||{};
+  let controller=null;
+  let timer=null;
+  if(opts.timeoutMs&&window.AbortController){
+    controller=new AbortController();
+    timer=setTimeout(()=>controller.abort(),opts.timeoutMs);
+  }
+  let res;
+  try{
+    res=await fetch(BASE+"/api",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(Object.assign({action},payload||{})),
+      signal:controller?controller.signal:undefined
+    });
+  }finally{
+    if(timer)clearTimeout(timer);
+  }
+  const text=await res.text();
+  let data={};
+  try{data=text?JSON.parse(text):{};}catch{data={ok:false,error:text||"bad response"}}
+  if(!res.ok||data.ok===false) throw new Error(data.error||res.statusText);
+  return data;
+}
+function setPre(id,text){$(id).textContent=text||""}
+function emptyList(id,text){
+  const box=$(id);box.innerHTML="";
+  const el=document.createElement("div");el.className="item";
+  el.textContent=text||"No data";
+  box.appendChild(el);
+}
+function makeItem(cls){
+  const el=document.createElement("div");
+  el.className="item"+(cls?" "+cls:"");
+  return el;
+}
+function addMeta(el,items){
+  const meta=document.createElement("div");
+  meta.className="meta";
+  (items||[]).forEach(text=>{const span=document.createElement("span");span.textContent=text;meta.appendChild(span)});
+  el.appendChild(meta);
+}
+function activateView(id){
+  document.querySelectorAll(".tab").forEach(btn=>btn.classList.toggle("active",btn.dataset.view===id));
+  document.querySelectorAll(".view").forEach(view=>view.classList.toggle("active",view.id===id));
+  if(id==="promptView")loadPromptPreview().catch(err=>showError(err.message||String(err)));
+  if(id==="memoryView")loadMemory().catch(err=>showError(err.message||String(err)));
+  if(id==="skillsView")loadSkills().catch(err=>showError(err.message||String(err)));
+  if(id==="panelView")loadPanelHistory().catch(err=>showError(err.message||String(err)));
+  if(id==="checkView")runSelfCheck().catch(err=>showError(err.message||String(err)));
+}
+async function loadPromptPreview(){
+  const message=$("previewInput").value.trim()||$("input").value.trim()||"Preview next user request";
+  const data=await api("prompt_preview",{message});
+  setPre("previewInstructions",data.instructions||"");
+  setPre("previewMemory",data.memory||"");
+  setPre("previewSkills",data.skills||"");
+  setPre("previewInputBlock",data.input||"");
+}
+async function loadMemory(){
+  const data=await api("memory_search",{query:$("memoryQuery").value.trim(),limit:30});
+  const box=$("memoryList");box.innerHTML="";
+  const items=data.memories||[];
+  if(!items.length){emptyList("memoryList","No memory facts");}
+  items.forEach(mem=>{
+    const el=makeItem();
+    const p=document.createElement("p");
+    p.textContent=mem.content||mem.text||"";
+    el.appendChild(p);
+    addMeta(el,[mem.id||"",mem.tags||"",mem.keywords||""].filter(Boolean));
+    const bar=document.createElement("div");bar.className="toolbar";
+    const del=document.createElement("button");del.type="button";del.className="danger";del.textContent="Delete";
+    del.addEventListener("click",async()=>{await api("memory_forget",{id:mem.id});await loadMemory();});
+    bar.appendChild(del);el.appendChild(bar);box.appendChild(el);
+  });
+  const prof=await api("memory_profiles");
+  const p=prof.profiles||{};
+  $("profileIdentity").value=p.identity||"";
+  $("profileUser").value=p.user||"";
+  $("profileSoul").value=p.soul||"";
+}
+async function exportMemory(){
+  const data=await api("memory_export");
+  $("memoryImportText").value=JSON.stringify(data,null,2);
+}
+async function importMemory(mode){
+  const raw=$("memoryImportText").value.trim();
+  if(!raw)throw new Error("memory import JSON is empty");
+  const data=JSON.parse(raw);
+  await api("memory_import",{mode,data});
+  await loadMemory();
+}
+async function saveProfiles(){
+  await api("memory_profiles_save",{profiles:{
+    identity:$("profileIdentity").value,
+    user:$("profileUser").value,
+    soul:$("profileSoul").value
+  }});
+  await loadMemory();
+}
+async function loadSkills(){
+  const data=await api("skills");
+  const cat=$("skillsCatalog");cat.innerHTML="";
+  const active=$("skillsActive");active.innerHTML="";
+  (data.catalog||[]).forEach(skill=>{
+    const el=makeItem((data.active||[]).includes(skill.id)?"ok":"");
+    const p=document.createElement("p");p.textContent=skill.id;el.appendChild(p);
+    addMeta(el,[skill.description||"",((skill.cap_groups||[]).join(","))].filter(Boolean));
+    cat.appendChild(el);
+  });
+  if(!(data.catalog||[]).length)emptyList("skillsCatalog","No skills");
+  (data.active||[]).forEach(id=>{
+    const el=makeItem("ok");el.textContent=id;active.appendChild(el);
+  });
+  if(!(data.active||[]).length)emptyList("skillsActive","No active skills");
+}
+async function loadPanelHistory(){
+  const data=await api("panel_history",{limit:12});
+  const box=$("panelHistory");box.innerHTML="";
+  const items=data.entries||[];
+  if(!items.length){emptyList("panelHistory","No panel runs");setPre("panelDetail","");return;}
+  items.forEach(item=>{
+    const el=makeItem(item.ok?"ok":"fail");
+    const p=document.createElement("p");
+    p.textContent=(item.title||"Panel")+" - "+(item.ok?"ok":"failed");
+    el.appendChild(p);
+    addMeta(el,[item.id||"",String(item.code_bytes||0)+" bytes",item.code_checksum||""].filter(Boolean));
+    const bar=document.createElement("div");bar.className="toolbar";
+    const view=document.createElement("button");view.type="button";view.textContent="View";
+    view.addEventListener("click",()=>loadPanelDetail(item.id).catch(err=>showError(err.message||String(err))));
+    const rerun=document.createElement("button");rerun.type="button";rerun.textContent="Rerun";
+    rerun.addEventListener("click",async()=>{const r=await api("panel_rerun",{id:item.id});setPre("panelDetail",JSON.stringify(r.result||r,null,2));await loadPanelHistory();});
+    bar.appendChild(view);bar.appendChild(rerun);el.appendChild(bar);box.appendChild(el);
+  });
+}
+async function loadPanelDetail(id){
+  const data=await api("panel_history_get",{id});
+  const item=data.item||{};
+  setPre("panelDetail","Title: "+(item.title||"")+"\nOK: "+String(item.ok)+"\nError: "+(item.error||"")+"\nStdout:\n"+(item.stdout||"")+"\n\nCode:\n"+(item.code||""));
+}
+async function runSelfCheck(){
+  const data=await api("self_check");
+  const box=$("selfCheckList");box.innerHTML="";
+  (data.checks||[]).forEach(ch=>{
+    const el=makeItem(ch.status||"");
+    const p=document.createElement("p");p.textContent=(ch.label||ch.id)+": "+(ch.status||"");el.appendChild(p);
+    addMeta(el,[ch.detail||""]);
+    box.appendChild(el);
+  });
+  if(!(data.checks||[]).length)emptyList("selfCheckList","No checks");
+}
+function imageSrc(raw){
+  const text=(raw||"").trim();
+  if(!text)return "";
+  if(/^data:image\//i.test(text))return text;
+  if(/^[A-Za-z0-9+/=\s]+$/.test(text)&&text.length>80)return "data:image/png;base64,"+text.replace(/\s+/g,"");
+  return "";
+}
+const QR_SPEC=[
+  {v:1,ecc:7,blocks:[19]},{v:2,ecc:10,blocks:[34]},{v:3,ecc:15,blocks:[55]},
+  {v:4,ecc:20,blocks:[80]},{v:5,ecc:26,blocks:[108]},{v:6,ecc:18,blocks:[68,68]},
+  {v:7,ecc:20,blocks:[78,78]},{v:8,ecc:24,blocks:[97,97]},{v:9,ecc:30,blocks:[116,116]},
+  {v:10,ecc:18,blocks:[68,68,69,69]}
+];
+const QR_ALIGN={1:[],2:[6,18],3:[6,22],4:[6,26],5:[6,30],6:[6,34],7:[6,22,38],8:[6,24,42],9:[6,26,46],10:[6,28,50]};
+const GF_EXP=new Array(512),GF_LOG=new Array(256);
+(function(){let x=1;for(let i=0;i<255;i++){GF_EXP[i]=x;GF_LOG[x]=i;x<<=1;if(x&256)x^=0x11d}for(let i=255;i<512;i++)GF_EXP[i]=GF_EXP[i-255]})();
+function gfMul(a,b){return a&&b?GF_EXP[GF_LOG[a]+GF_LOG[b]]:0}
+function rsGen(deg){
+  let poly=[1];
+  for(let i=0;i<deg;i++){
+    const next=new Array(poly.length+1).fill(0);
+    for(let j=0;j<poly.length;j++){next[j]^=poly[j];next[j+1]^=gfMul(poly[j],GF_EXP[i])}
+    poly=next;
+  }
+  return poly.slice(1);
+}
+function rsEncode(data,deg){
+  const gen=rsGen(deg),rem=new Array(deg).fill(0);
+  data.forEach(b=>{
+    const factor=b^rem.shift();
+    rem.push(0);
+    for(let i=0;i<deg;i++)rem[i]^=gfMul(gen[i],factor);
+  });
+  return rem;
+}
+function makeQr(data){
+  const bytes=Array.from(new TextEncoder().encode(data));
+  let spec=null;
+  for(const s of QR_SPEC){
+    const cc=s.v<10?8:16,cap=s.blocks.reduce((a,b)=>a+b,0)*8;
+    if(4+cc+bytes.length*8<=cap){spec=s;break}
+  }
+  if(!spec)throw new Error("QR data too long");
+  const capBytes=spec.blocks.reduce((a,b)=>a+b,0),bits=[];
+  const push=(val,len)=>{for(let i=len-1;i>=0;i--)bits.push((val>>>i)&1)};
+  push(4,4);push(bytes.length,spec.v<10?8:16);bytes.forEach(b=>push(b,8));
+  for(let i=0;i<4&&bits.length<capBytes*8;i++)bits.push(0);
+  while(bits.length%8)bits.push(0);
+  const dataCw=[];
+  for(let i=0;i<bits.length;i+=8)dataCw.push(bits.slice(i,i+8).reduce((a,b)=>(a<<1)|b,0));
+  for(let pad=0xec;dataCw.length<capBytes;pad=pad===0xec?0x11:0xec)dataCw.push(pad);
+  const blocks=[];let off=0;
+  spec.blocks.forEach(len=>{const d=dataCw.slice(off,off+len);off+=len;blocks.push({d,e:rsEncode(d,spec.ecc)})});
+  const code=[];
+  for(let i=0;i<Math.max(...blocks.map(b=>b.d.length));i++)blocks.forEach(b=>{if(i<b.d.length)code.push(b.d[i])});
+  for(let i=0;i<spec.ecc;i++)blocks.forEach(b=>code.push(b.e[i]));
+  const n=17+4*spec.v,m=Array.from({length:n},()=>Array(n).fill(false)),fn=Array.from({length:n},()=>Array(n).fill(false));
+  const set=(r,c,v,f)=>{if(r>=0&&r<n&&c>=0&&c<n){m[r][c]=!!v;if(f)fn[r][c]=true}};
+  const getB=(x,i)=>((x>>>i)&1)!==0;
+  const finder=(r,c)=>{for(let y=-1;y<=7;y++)for(let x=-1;x<=7;x++){const rr=r+y,cc=c+x;if(rr<0||rr>=n||cc<0||cc>=n)continue;const on=y>=0&&y<=6&&x>=0&&x<=6&&(y===0||y===6||x===0||x===6||(y>=2&&y<=4&&x>=2&&x<=4));set(rr,cc,on,true)}};
+  finder(0,0);finder(0,n-7);finder(n-7,0);
+  for(let i=8;i<n-8;i++){set(6,i,i%2===0,true);set(i,6,i%2===0,true)}
+  (QR_ALIGN[spec.v]||[]).forEach(r=>(QR_ALIGN[spec.v]||[]).forEach(c=>{
+    if((r<9&&c<9)||(r<9&&c>n-10)||(r>n-10&&c<9))return;
+    for(let y=-2;y<=2;y++)for(let x=-2;x<=2;x++)set(r+y,c+x,Math.max(Math.abs(x),Math.abs(y))!==1,true);
+  }));
+  set(n-8,8,true,true);
+  function format(mask){
+    const data=(1<<3)|mask;let rem=data;
+    for(let i=0;i<10;i++)rem=(rem<<1)^(((rem>>>9)&1)?0x537:0);
+    const b=((data<<10)|rem)^0x5412;
+    for(let i=0;i<=5;i++)set(i,8,getB(b,i),true);
+    set(7,8,getB(b,6),true);set(8,8,getB(b,7),true);set(8,7,getB(b,8),true);
+    for(let i=9;i<15;i++)set(8,14-i,getB(b,i),true);
+    for(let i=0;i<8;i++)set(8,n-1-i,getB(b,i),true);
+    for(let i=8;i<15;i++)set(n-15+i,8,getB(b,i),true);
+  }
+  function versionInfo(){
+    if(spec.v<7)return;
+    let rem=spec.v;
+    for(let i=0;i<12;i++)rem=(rem<<1)^(((rem>>>11)&1)?0x1f25:0);
+    const b=(spec.v<<12)|rem;
+    for(let i=0;i<18;i++){const bit=getB(b,i),a=n-11+i%3,bb=Math.floor(i/3);set(a,bb,bit,true);set(bb,a,bit,true)}
+  }
+  format(0);versionInfo();
+  let bit=0,up=true;
+  for(let c=n-1;c>0;c-=2){
+    const right=c<=6?c-1:c;
+    for(let j=0;j<n;j++){
+      const r=up?n-1-j:j;
+      for(let dc=0;dc<2;dc++){
+        const cc=right-dc;
+        if(fn[r][cc])continue;
+        const val=bit<code.length*8?getB(code[Math.floor(bit/8)],7-bit%8):false;
+        set(r,cc,val,false);bit++;
+      }
+    }
+    up=!up;
+  }
+  for(let r=0;r<n;r++)for(let c=0;c<n;c++)if(!fn[r][c]&&((r+c)%2===0))m[r][c]=!m[r][c];
+  format(0);versionInfo();
+  return m;
+}
+function renderQr(data,canvas){
+  const ctx=canvas.getContext("2d");
+  canvas.width=220;canvas.height=220;
+  ctx.fillStyle="#fff";ctx.fillRect(0,0,220,220);
+  if(!data)return;
+  const matrix=makeQr(data),quiet=4,modules=matrix.length+quiet*2,px=Math.max(2,Math.floor(220/modules)),size=px*modules,off=Math.floor((220-size)/2);
+  ctx.fillStyle="#fff";ctx.fillRect(0,0,220,220);
+  ctx.fillStyle="#111";
+  matrix.forEach((row,r)=>row.forEach((on,c)=>{if(on)ctx.fillRect(off+(c+quiet)*px,off+(r+quiet)*px,px,px)}));
+}
+function applyState(st){
+  $("route").textContent=st.route_base||BASE;
+  const job=st.chat_job||{};
+  const jobBusy=job.status==="queued"||job.status==="running";
+  $("statusText").textContent=jobBusy?job.status:(st.busy?"busy":(st.last_error?"warn":"ready"));
+  $("dot").className="dot "+((st.busy||jobBusy)?"busy":(st.last_error?"warn":""));
+  $("llmReady").textContent=st.llm_ready?"LLM ready":"LLM missing";
+  $("wechatReady").textContent=st.wechat&&st.wechat.enabled?(st.wechat.configured?"WeChat on":"WeChat token"):"WeChat off";
+  $("toolCount").textContent="Tools "+(st.tool_count||0);
+  if(st.wechat&&st.wechat.qr)setWechatQrText(st.wechat.qr);
+  const logs=$("logs");
+  logs.innerHTML="";
+  (st.logs||[]).slice(0,18).forEach(item=>{
+    const el=document.createElement("div");
+    el.className="log";
+    el.textContent=(item.kind||"info")+": "+(item.text||"");
+    logs.appendChild(el);
+  });
+  applyProgressLogs(st.logs||[]);
+}
+let wechatQrTimer=null;
+function stopWechatQrPoll(){
+  if(wechatQrTimer){clearTimeout(wechatQrTimer);wechatQrTimer=null}
+}
+function setWechatQrText(qr){
+  const text=qr&&qr.status?("Status: "+qr.status):"Status: idle";
+  $("wechatQrStatus").textContent=qr&&qr.message?text+" - "+qr.message:text;
+}
+function setWechatQrBusy(busy){
+  $("wechatQrStart").disabled=!!busy;
+  $("wechatQrCancel").disabled=!!busy;
+}
+function applyWechatQr(qr){
+  setWechatQrText(qr);
+  const stage=$("qrStage");
+  stage.innerHTML="";
+  const raw=(qr&&qr.qr_data_url)||"";
+  const src=imageSrc(raw);
+  if(src){
+    const img=document.createElement("img");
+    img.alt="WeChat login QR code";
+    img.src=src;
+    stage.appendChild(img);
+  }else if(raw){
+    try{
+      const canvas=document.createElement("canvas");
+      renderQr(raw,canvas);
+      stage.appendChild(canvas);
+    }catch(err){
+      const empty=document.createElement("span");
+      empty.className="empty";
+      empty.textContent="QR unavailable";
+      stage.appendChild(empty);
+      showError("QR render: "+(err.message||String(err)));
+    }
+  }else{
+    const empty=document.createElement("span");
+    empty.className="empty";
+    empty.textContent="No QR";
+    stage.appendChild(empty);
+  }
+  const link=$("wechatQrLink");
+  if(/^https?:\/\//i.test(raw)){link.href=raw;link.hidden=false}else{link.hidden=true}
+  if(qr&&qr.completed&&qr.token){
+    $("wechat_token").value=qr.token;
+    $("wechat_enabled").checked=true;
+    if(qr.base_url)$("wechat_base_url").value=qr.base_url;
+    stopWechatQrPoll();
+  }
+}
+async function pollWechatQr(){
+  const data=await api("wechat_qr_status",{}, {timeoutMs:2500});
+  applyWechatQr(data);
+  if(data.active&&!data.completed){
+    wechatQrTimer=setTimeout(()=>pollWechatQr().catch(err=>showError(err.message||String(err))),1500);
+  }
+}
+async function refresh(){
+  const data=await api("state",{}, {timeoutMs:2500});
+  applyState(data);
+}
+async function loadConfig(){
+  const data=await api("config");
+  const c=data.config||{};
+  $("llm_base_url").value=c.llm_base_url||"";
+  $("llm_model").value=c.llm_model||"";
+  $("llm_thinking_enabled").checked=c.llm_thinking_enabled!==false;
+  $("llm_thinking_for_code_only").checked=c.llm_thinking_for_code_only!==false;
+  $("llm_reasoning_effort").value=c.llm_reasoning_effort==="max"?"max":"high";
+  $("wechat_enabled").checked=!!c.wechat_enabled;
+  $("wechat_base_url").value=c.wechat_base_url||"";
+}
+async function waitForChatJob(jobId){
+  let misses=0;
+  while(true){
+    await sleepMs(900);
+    let data=null;
+    try{
+      data=await api("chat_result",{job_id:jobId},{timeoutMs:2500});
+      misses=0;
+      showError("");
+    }catch(err){
+      misses++;
+      if(misses>1)showError("Waiting for device...");
+      continue;
+    }
+    applyState(data.state||{});
+    const job=data.job||{};
+    if(job.status==="done")return job.reply||"";
+    if(job.status==="error")throw new Error(job.error||"chat job failed");
+    if(job.status==="idle")throw new Error("chat job is not active");
+  }
+}
+$("composer").addEventListener("submit",async ev=>{
+  ev.preventDefault();
+  const input=$("input");
+  const text=input.value.trim();
+  if(!text)return;
+  input.value="";
+  addMsg("user",text);
+  $("send").disabled=true;
+  showError("");
+  const pending=addMsg("assistant","Working...");
+  try{
+    const data=await api("chat",{message:text},{timeoutMs:8000});
+    applyState(data.state||{});
+    if(data.busy){
+      pending.textContent="Busy. Try again when the current task finishes.";
+    }else if(data.job_id){
+      const reply=await waitForChatJob(data.job_id);
+      pending.textContent=reply||"Done.";
+    }else{
+      pending.textContent=data.reply||"Done.";
+    }
+  }catch(err){
+    showError(err.message||String(err));
+    pending.textContent="Error: "+(err.message||String(err));
+    refresh().catch(()=>{});
+  }finally{
+    $("send").disabled=false;
+    input.focus();
+  }
+});
+$("configForm").addEventListener("submit",async ev=>{
+  ev.preventDefault();
+  showError("");
+  const body={
+    llm_base_url:$("llm_base_url").value.trim(),
+    llm_model:$("llm_model").value.trim(),
+    llm_api_key:$("llm_api_key").value.trim()||"__keep__",
+    llm_thinking_enabled:$("llm_thinking_enabled").checked,
+    llm_thinking_for_code_only:$("llm_thinking_for_code_only").checked,
+    llm_reasoning_effort:$("llm_reasoning_effort").value,
+    wechat_enabled:$("wechat_enabled").checked,
+    wechat_base_url:$("wechat_base_url").value.trim(),
+    wechat_token:$("wechat_token").value.trim()||"__keep__"
+  };
+  try{
+    await api("save_config",body);
+    $("llm_api_key").value="";
+    $("wechat_token").value="";
+    await refresh();
+  }catch(err){showError(err.message||String(err))}
+});
+$("reset").addEventListener("click",async()=>{
+  showError("");
+  try{
+    messages.length=0;
+    $("messages").innerHTML="";
+    const data=await api("reset");
+    applyState(data.state||{});
+  }catch(err){showError(err.message||String(err))}
+});
+document.querySelectorAll(".tab").forEach(btn=>{
+  btn.addEventListener("click",()=>activateView(btn.dataset.view));
+});
+$("previewRun").addEventListener("click",()=>loadPromptPreview().catch(err=>showError(err.message||String(err))));
+$("memorySearch").addEventListener("click",()=>loadMemory().catch(err=>showError(err.message||String(err))));
+$("memoryQuery").addEventListener("keydown",ev=>{
+  if(ev.key==="Enter")loadMemory().catch(err=>showError(err.message||String(err)));
+});
+$("memoryExport").addEventListener("click",()=>exportMemory().catch(err=>showError(err.message||String(err))));
+$("memoryImportMerge").addEventListener("click",()=>importMemory("merge").catch(err=>showError(err.message||String(err))));
+$("memoryImportReplace").addEventListener("click",()=>{
+  if(!confirm("Replace memory facts and session?"))return;
+  importMemory("replace").catch(err=>showError(err.message||String(err)));
+});
+$("memoryClearSession").addEventListener("click",async()=>{
+  try{await api("memory_clear",{scope:"session"});await loadMemory();}catch(err){showError(err.message||String(err))}
+});
+$("profilesSave").addEventListener("click",()=>saveProfiles().catch(err=>showError(err.message||String(err))));
+$("skillsRefresh").addEventListener("click",()=>loadSkills().catch(err=>showError(err.message||String(err))));
+$("skillsClear").addEventListener("click",async()=>{
+  try{await api("skills_clear");await loadSkills();await loadPromptPreview();}catch(err){showError(err.message||String(err))}
+});
+$("panelRefresh").addEventListener("click",()=>loadPanelHistory().catch(err=>showError(err.message||String(err))));
+$("panelClear").addEventListener("click",async()=>{
+  if(!confirm("Clear panel history?"))return;
+  try{await api("panel_clear");await loadPanelHistory();}catch(err){showError(err.message||String(err))}
+});
+$("selfCheckRun").addEventListener("click",()=>runSelfCheck().catch(err=>showError(err.message||String(err))));
+$("wechatQrStart").addEventListener("click",async()=>{
+  showError("");
+  stopWechatQrPoll();
+  setWechatQrBusy(true);
+  try{
+    const data=await api("wechat_qr_start",{
+      force:true,
+      wechat_base_url:$("wechat_base_url").value.trim()
+    });
+    applyWechatQr(data);
+    if(data.active&&!data.completed){
+      wechatQrTimer=setTimeout(()=>pollWechatQr().catch(err=>showError(err.message||String(err))),1000);
+    }
+  }catch(err){showError(err.message||String(err))}
+  finally{setWechatQrBusy(false)}
+});
+$("wechatQrCancel").addEventListener("click",async()=>{
+  showError("");
+  stopWechatQrPoll();
+  setWechatQrBusy(true);
+  try{
+    const data=await api("wechat_qr_cancel");
+    applyWechatQr(data);
+  }catch(err){showError(err.message||String(err))}
+  finally{setWechatQrBusy(false)}
+});
+(async function boot(){
+  try{
+    await loadConfig();
+    await refresh();
+    pollWechatQr().catch(()=>{});
+    addMsg("assistant","Ready.");
+    setInterval(()=>refresh().catch(()=>{}),3500);
+  }catch(err){showError(err.message||String(err))}
+})();
+</script>
+</body>
+</html>

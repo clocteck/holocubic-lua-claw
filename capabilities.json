@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "platform": "ESP32-S3 Lua/LVGL device",
+  "routing": {
+    "rule": "LVGL/UI code runs on Claw Panel; non-UI Lua runs in ESP Claw service.",
+    "panel_markers": ["lv_", "LV_", "lvgl", "LVGL", "ui_scr_act", "ui_clear"]
+  },
+  "lua_modules": ["tmr", "file", "wifi", "net", "httpd", "http", "uart", "i2s", "websocket", "json", "sjson", "app", "sys"],
+  "timer": {
+    "preferred": "local timer = add_timer(tmr.create()); timer:alarm(ms, tmr.ALARM_AUTO, cb)",
+    "constants": ["tmr.ALARM_SINGLE", "tmr.ALARM_AUTO", "tmr.ALARM_SEMI"],
+    "avoid": ["local variable named tmr", "timer:register unless probed"]
+  },
+  "lvgl": {
+    "colors": "Use 0xRRGGBB numbers directly; lv_color_hex is not available.",
+    "integer_pixels": true,
+    "functions": {
+      "lv_scr_act": true,
+      "lv_layer_top": true,
+      "lv_obj_create": true,
+      "lv_obj_clean": true,
+      "lv_obj_del": true,
+      "lv_obj_set_pos": true,
+      "lv_obj_set_size": true,
+      "lv_obj_set_x": true,
+      "lv_obj_set_y": true,
+      "lv_obj_set_width": true,
+      "lv_obj_set_height": true,
+      "lv_obj_align": true,
+      "lv_obj_center": true,
+      "lv_obj_align_to": true,
+      "lv_obj_set_style_bg_color": true,
+      "lv_obj_set_style_bg_opa": true,
+      "lv_obj_set_style_border_width": true,
+      "lv_obj_set_style_border_color": true,
+      "lv_obj_set_style_radius": true,
+      "lv_obj_set_style_pad_all": true,
+      "lv_obj_set_style_text_color": true,
+      "lv_obj_set_style_text_font": true,
+      "lv_obj_set_style_text_align": true,
+      "lv_obj_set_style_line_width": true,
+      "lv_obj_set_style_line_color": true,
+      "lv_obj_set_style_line_rounded": true,
+      "lv_obj_set_style_opa": true,
+      "lv_label_create": true,
+      "lv_label_set_text": true,
+      "lv_line_create": true,
+      "lv_line_set_points": true,
+      "lv_btn_create": true,
+      "lv_checkbox_create": true,
+      "lv_dropdown_create": true,
+      "lv_textarea_create": true,
+      "lv_keyboard_create": true,
+      "lv_canvas_create": true,
+      "lv_canvas_frame_begin": true,
+      "lv_canvas_fill_bg": true,
+      "lv_canvas_draw_rect": true,
+      "lv_canvas_draw_line": true,
+      "lv_canvas_draw_text": true,
+      "lv_canvas_draw_arc": true,
+      "lv_canvas_draw_img": true,
+      "lv_canvas_frame_end": true
+    }
+  },
+  "canvas": {
+    "lifecycle": "lv_canvas_frame_begin(cvs); draw/fill; lv_canvas_frame_end(cvs)",
+    "draw_line": "lv_canvas_draw_line(cvs,x1,y1,x2,y2,color,opa)",
+    "thick_lines": "Draw several offset lines or use lv_line with style_line_width."
+  }
+}

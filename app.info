@@ -1,0 +1,4 @@
+name = ESP Claw Service
+kind = service
+autostart_service = true
+entry = main.lua
