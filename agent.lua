@@ -543,6 +543,8 @@ local function classify_task(user_text, source)
     "帮我实现", "帮我写", "帮我改", "帮我修",
     "写一个", "运行", "上传", "修复", "帮我测试", "测试一下",
     "直接实现", "直接写", "直接运行", "跑起来",
+    "设置", "调整", "调一下", "调高", "调低", "改成", "改到",
+    "打开", "关闭", "启动", "停止", "发送", "更新",
   }) or lower:find("implement", 1, true) or lower:find("draw ", 1, true)
     or lower:find("build ", 1, true) or lower:find("fix ", 1, true)
     or lower:find("run ", 1, true) or lower:find("write ", 1, true)
@@ -742,6 +744,8 @@ local function user_expects_action(text)
     "帮我实现", "帮我写", "帮我改", "帮我修", "帮我上传", "帮我测试",
     "直接实现", "直接写", "直接运行", "上代码",
     "运行代码", "写代码", "跑起来",
+    "设置", "调整", "调一下", "调高", "调低", "改成", "改到",
+    "打开", "关闭", "启动", "停止", "发送", "更新",
     "继续做", "继续写", "继续实现", "接着做", "接着写", "接着改",
     "从头实现", "完整实现",
   }) then
@@ -1008,6 +1012,14 @@ local function is_context_tool(name)
     or name == "get_panel_artifacts"
     or name == "get_code_capabilities"
     or name == "preflight_lua"
+end
+
+local function is_read_only_evidence_tool(name)
+  return is_context_tool(name)
+    or name == "get_device_status"
+    or name == "memory_recall"
+    or name == "memory_list"
+    or name == "lookup_context"
 end
 
 local function lua_run_error_text(output)
@@ -1693,6 +1705,9 @@ local function append_task_policy(parts, task_plan, source, opts)
     parts[#parts + 1] = (opts.plan_label or "Agent task plan:") .. " " .. raw_plan
   end
   parts[#parts + 1] = "Use the task plan as routing context; the latest user request remains authoritative."
+  if task_plan.execution_required == true then
+    parts[#parts + 1] = "When the latest request asks to change, set, update, start, stop, run, send, or otherwise act, context/status tools are only preparation; complete the action with the appropriate non-read tool."
+  end
   if task_plan.text_first_request == true
     or task_plan.execution_required == false
     or task_plan.allow_text_only == true then
@@ -1798,8 +1813,9 @@ local function tool_followup_input(user_text, tool_results, source, task_plan, f
     "Continue the same user request using these results.",
     "Decide whether the original request still requires execution. If it does, continue with tools; if it is complete, summarize the actual result.",
     "If a tool result contains stdout/data that answers the user's request, write the final user-facing answer now. Do not stop after progress text, and do not call more tools unless the requested information is clearly missing.",
-    "Result-present example: if status says brightness=80 and set_brightness returns ok level=30, answer '当前亮度是 80，已调到 30。' and end the turn.",
-    "Result-missing example: if a read, run, or setting call fails, times out, or returns no confirmed value, say the result is not confirmed and either continue with the next necessary tool or report the failure. Never write a success summary from a missing result.",
+    "For action requests, read/status/inspection results are intermediate evidence, not completion. Use them to choose the next concrete action tool unless the user only asked to read or inspect.",
+    "Result-present example: if a read tool returns the old value and the later action tool returns ok with the new value, answer with both values in one concise sentence and end the turn.",
+    "Result-missing example: if the required action tool fails, times out, or returns no confirmed value after it was attempted, say the result is not confirmed and either continue with the next necessary tool or report the failure. Never write a success summary from a missing action result.",
     "After a final answer with an actual result, do not continue with apologies, summaries, or repeated confirmations unless the user asks another question.",
     "activate_skill only loads operating instructions; context/preflight/history tools do not complete the requested action by themselves.",
     "For Lua app, UI, HTTP, file, or device-code work, use code_runner tools; memory_ops is only for explicit long-term memory operations.",
@@ -1886,8 +1902,8 @@ local function tool_summary_input(user_text, tool_results, source, task_plan)
     "If an earlier tool call failed but a later tool call succeeded, say it was repaired instead of claiming there were no failures.",
     "Do not offer to rerun, continue, or wait for confirmation after the requested work is already complete.",
     "End after the final result. One concise sentence is enough for simple device actions; do not add apologies, repeated confirmations, or promises about future behavior.",
-    "Result-present example: '当前亮度是 80，已调到 30。'",
-    "Result-missing example: '没有拿到确认结果，亮度是否已调整还不能确认。'",
+    "Result-present example: '当前值是 X，已改到 Y。'",
+    "Result-missing example: '没有拿到确认结果，这次修改是否完成还不能确认。'",
     "If the outputs show only queued, timeout, ok=false, or no requested data, use the result-missing pattern rather than a success pattern.",
   }
   if type(source) == "table" and source.channel == "wechat" then
@@ -2097,6 +2113,7 @@ local function response_instructions(source)
     "When you call tools for a user-visible task, include one short user-facing progress sentence before the tool call when the API supports assistant text plus tool calls. Say what you understood and what you are about to verify or run; do not present it as the final result.",
     "Completion boundary: after tools return enough evidence and you have written the final user-facing result, stop this turn. Do not add extra apologies, recaps, repeated confirmations, or 'next time' promises unless the latest user explicitly asks for them.",
     "No-result boundary: if a required tool returns no usable result, an error, a timeout, or only an unconfirmed queued state, do not imply success. Continue with a needed tool if one is available; otherwise state concisely that no confirmed result was obtained.",
+    "For action requests, reading status or context is only a precondition. Do not use a no-result final answer just because only the read step has run; continue to the concrete action tool when available.",
     "Never delete directories or broad paths such as /sd. For a single file delete, ask for explicit confirmation first and do not delete in the same turn.",
     "Summaries of tool work must be grounded in tool arguments and outputs; queued/timeouts are not confirmed success.",
     "Current configured underlying LLM model: " .. core.text_or(M.APP.config.llm_model, "unknown"),
@@ -2631,6 +2648,7 @@ local function completion_self_review(user_text, candidate_text, tool_results, s
     "For tool-backed answers, claimed facts must appear in tool outputs or known observations.",
     "A concise final answer with the requested confirmed result is complete even if it does not apologize, recap history, or mention future behavior.",
     "If the required result is missing, failed, timed out, or unconfirmed, a success-style answer is incomplete; prefer rewrite to a concise no-confirmed-result answer when no further tool can help.",
+    "If the user requested a change/action and the candidate answer only reports a read/status result, it is incomplete; choose continue when an action tool is still available.",
     "For live lookup, web_probe is only reachability/status evidence. Page contents, lists, prices, model specs, and article facts require web_fetch, lookup_context items, or another content-bearing tool result.",
     "Skill activation, status checks, directory listings, and preflight checks are not enough when the user asked for concrete file contents, code changes, or fetched page contents.",
     "For code/run tasks, the answer should mention the observed success/error and repair path when relevant.",
@@ -3089,6 +3107,24 @@ local function normalize_router_target(value, fallback)
   return target
 end
 
+local function looks_like_non_visual_action(user_text, fallback)
+  local text = M.APP.core.text_or(user_text, "")
+  fallback = type(fallback) == "table" and fallback or {}
+  if fallback.target ~= "service" or fallback.has_code_context == true then
+    return false
+  end
+  if text_has_any(text, {
+    "画", "绘制", "动画", "UI", "LVGL", "Canvas", "canvas",
+    "面板", "界面", "可视化", "图形", "布局",
+  }) then
+    return false
+  end
+  return text_has_any(text, {
+    "设置", "调整", "调一下", "调高", "调低", "改成", "改到",
+    "打开", "关闭", "启动", "停止", "发送", "更新",
+  })
+end
+
 local function apply_task_plan_policy(plan, fallback, user_text, source)
   local core = M.APP.core
   fallback = type(fallback) == "table" and fallback or classify_task(user_text, source)
@@ -3160,6 +3196,16 @@ local function apply_task_plan_policy(plan, fallback, user_text, source)
     target = "service"
   end
 
+  if looks_like_non_visual_action(user_text, fallback) then
+    if target == "panel" then
+      target = "service"
+    end
+    needs_history = false
+    if mode == "inspect" or mode == "modify_previous" or mode == "debug_previous" then
+      mode = core.text_or(fallback.mode, "new_code")
+    end
+  end
+
   local out = {
     mode = mode,
     needs_history = needs_history,
@@ -3223,11 +3269,14 @@ local function model_route_task(user_text, source, fallback)
     "Allowed target values: unknown, service, panel.",
     "Use answer/code_review when the user asks to discuss, explain, review, or says text first.",
     "Use inspect when the user wants real local app/source/files under /sd/apps to be read.",
+    "Do not use inspect for a requested setting/state change; inspect is for reading or examining, not for completing an action.",
     "Use debug_previous with needs_history=true for follow-up failure reports such as a prior visual not rendering, not showing, drawing nothing, errors, or asking why the previous result failed.",
     "Interpret the latest request semantically. If the user is complaining that expected behavior is absent, route it as restoring or implementing that behavior; only route removal when the user actually asks to remove it.",
     "Use live_lookup when the user needs current external facts such as prices, news, weather, exchange rates, or latest public info.",
     "Words such as today, latest, weather, or price are hints only; choose live_lookup only when the user is really asking for current external facts.",
     "Use panel only for visible UI/LVGL/Canvas/screen visual work; use service for HTTP, files, source reading, and non-UI Lua.",
+    "Do not route device settings, status reads, or app/service controls as panel visual work just because they mention the screen or display.",
+    "Panel is for drawing or modifying UI artifacts, animations, canvas/LVGL scenes, or visible layouts. Setting a property, changing a device/app state, sending something, or starting/stopping something is a service/device action unless the user explicitly asks to draw or edit a UI artifact.",
     "Set execution_required=true only when the current turn needs a real tool/action, not just an explanation.",
     "Schema: {\"mode\":\"...\",\"target\":\"...\",\"execution_required\":true,\"allow_text_only\":false,\"needs_history\":false,\"has_code_context\":false,\"live_lookup_hint\":false,\"confidence\":0.0,\"reason\":\"short\"}",
   }, "\n")
@@ -3692,6 +3741,10 @@ local function run_agent(user_text, source)
           should_finish = false
         end
         if name == "lua_run" and lua_run_needs_followup(user_text, args, output, task_plan, source) then
+          should_finish = false
+        end
+        if should_finish and is_read_only_evidence_tool(name)
+          and plan_expects_implementation and turn_expects_action(user_text, source) then
           should_finish = false
         end
         if should_finish then
