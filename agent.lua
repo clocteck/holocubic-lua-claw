@@ -84,6 +84,11 @@ local function llm_request_timeout(source, task_plan)
   return request_timeout
 end
 
+local function task_is_code_action(plan)
+  return type(plan) == "table"
+    and (plan.mode == "new_code" or plan.mode == "modify_previous" or plan.mode == "debug_previous")
+end
+
 -- 判断 LLM 配置是否完整。
 local function chat_messages(input, instructions)
   local messages = {}
@@ -535,14 +540,12 @@ local function classify_task(user_text, source)
     or lower:find("code", 1, true) ~= nil
 
   local execution_request = text_has_any(text, {
-    "帮我画", "帮我实现", "帮我做", "帮我写", "帮我改", "帮我修",
-    "画一个", "做一个", "写一个", "运行", "上传", "修复", "改成", "帮我测试", "测试一下",
-    "补上", "加上", "加一", "加个", "添加", "增加", "加入", "优化", "增强",
-    "直接实现", "直接做", "直接写", "直接运行", "跑起来", "开始写", "开写",
+    "帮我实现", "帮我写", "帮我改", "帮我修",
+    "写一个", "运行", "上传", "修复", "帮我测试", "测试一下",
+    "直接实现", "直接写", "直接运行", "跑起来",
   }) or lower:find("implement", 1, true) or lower:find("draw ", 1, true)
     or lower:find("build ", 1, true) or lower:find("fix ", 1, true)
     or lower:find("run ", 1, true) or lower:find("write ", 1, true)
-    or lower:find("add ", 1, true) or lower:find("improve", 1, true)
 
   local text_first_request = explicit_text_only and text_has_any(text, {
     "先文字", "只文字", "先说想法", "先分析", "先不要改", "先别改",
@@ -590,33 +593,28 @@ local function classify_task(user_text, source)
     or (has_code_context and not explicit_text_only and text_has_any(text, { "测试", "调试", "改一下", "调整" }))
 
   local fresh_creation = text_has_any(text, {
-    "帮我画", "帮我实现", "帮我做", "帮我写", "画一个", "做一个", "写一个",
-    "实现一个", "新建", "从头", "重新做一个",
+    "帮我实现", "帮我写", "写一个", "实现一个", "新建", "从头", "重新做一个",
   }) or lower:find("draw ", 1, true) or lower:find("build ", 1, true)
 
   local previous_cue = text_has_any(text, {
     "之前", "上一", "上次", "刚才", "刚才代码", "继续", "基于", "基础上", "保留",
-    "没显示", "不显示", "看不到", "没有显示", "没画", "没出来", "没有出来", "画不出来", "错", "错误", "报错",
-    "修", "改一下", "调整", "补上", "加上", "加一", "加个",
-    "添加", "增加", "加入", "优化", "增强", "少了", "缺少", "不对",
+    "错误", "报错", "失败", "改一下", "调整",
   }) or lower:find("previous", 1, true) or lower:find("last", 1, true)
     or lower:find("continue", 1, true) or lower:find("fix", 1, true)
-    or lower:find("add ", 1, true) or lower:find("improve", 1, true)
 
   local visual = text_has_any(text, {
-    "画", "显示", "屏幕", "面板", "动画", "旋转", "摆", "立方体", "圆锥",
-    "圆角", "Canvas", "LVGL", "UI", "轨迹", "颜色", "线条",
+    "屏幕", "面板", "动画", "Canvas", "LVGL", "UI",
   }) or lower:find("lvgl", 1, true) or lower:find("canvas", 1, true)
 
   local mode = "answer"
   if asks_code then
     if previous_cue and not fresh_creation then
-      mode = text_has_any(text, { "报错", "错误", "没显示", "不显示", "看不到", "没画", "没出来", "画不出来", "失败" }) and "debug_previous" or "modify_previous"
+      mode = text_has_any(text, { "报错", "错误", "失败" }) and "debug_previous" or "modify_previous"
     else
       mode = "new_code"
     end
   elseif previous_cue then
-    mode = text_has_any(text, { "没显示", "不显示", "看不到", "没画", "没出来", "画不出来", "报错", "错误", "失败" })
+    mode = text_has_any(text, { "报错", "错误", "失败" })
       and "debug_previous" or "inspect"
   end
 
@@ -741,22 +739,17 @@ local function user_expects_action(text)
   end
 
   if text_has_any(text, {
-    "帮我实现", "帮我做", "帮我写", "帮我改", "帮我修", "帮我上传", "帮我测试",
-    "直接实现", "直接做", "直接写", "直接运行", "直接给我做", "直接上", "上代码",
-    "我要补上", "我要实现", "我要做", "我要接", "我要运行", "我要写",
-    "补上真实", "接真实", "接入真实", "实现这个", "实现这个app", "实现这个 App",
-    "写代码", "运行代码", "跑起来", "开始做", "开始写", "开写", "开干",
+    "帮我实现", "帮我写", "帮我改", "帮我修", "帮我上传", "帮我测试",
+    "直接实现", "直接写", "直接运行", "上代码",
+    "运行代码", "写代码", "跑起来",
     "继续做", "继续写", "继续实现", "接着做", "接着写", "接着改",
-    "没显示", "不显示", "看不到", "没画", "没出来", "画不出来",
-    "在刚才代码基础上", "在之前代码基础上", "基于刚才", "基于之前",
-    "加一", "加个", "加上", "添加", "增加", "加入", "优化", "增强",
-    "全部从头实现", "从头实现", "完整实现",
+    "从头实现", "完整实现",
   }) then
     return true
   end
 
   if text_has_any(text, { "好的", "可以", "行", "开始", "继续", "来", "上" })
-    and text_has_any(text, { "补上", "实现", "接入", "真实数据", "运行", "做", "写", "代码" }) then
+    and text_has_any(text, { "实现", "运行", "做", "写", "代码" }) then
     return true
   end
   return false
@@ -773,15 +766,10 @@ local function user_expects_implementation(text)
   end
   return text_has_any(text, {
     "帮我实现", "帮我做", "帮我写", "帮我改", "帮我修",
-    "直接实现", "直接做", "直接写", "直接给我做", "直接上", "上代码",
-    "我要补上", "我要实现", "我要做", "我要接", "我要写",
-    "补上真实", "接真实", "接入真实", "实现这个", "实现这个app", "实现这个 App",
-    "写代码", "跑起来", "开始写", "开写", "开干", "继续做", "继续写", "继续实现",
+    "直接实现", "直接写", "上代码",
+    "写代码", "跑起来", "继续做", "继续写", "继续实现",
     "接着做", "接着写", "接着改",
-    "没显示", "不显示", "看不到", "没画", "没出来", "画不出来",
-    "在刚才代码基础上", "在之前代码基础上", "基于刚才", "基于之前",
-    "加一", "加个", "加上", "添加", "增加", "加入", "优化", "增强",
-    "全部从头实现", "从头实现", "完整实现",
+    "从头实现", "完整实现",
   })
 end
 
@@ -852,17 +840,11 @@ local function response_looks_like_deferral(text)
     or lower:find("if needed", 1, true)
     or lower:find("tell me which", 1, true)
     or lower:find("which part", 1, true)
-    or text_has_any(text, {
-      "请告诉我具体", "告诉我具体", "需要哪部分", "需要哪个部分", "你要看哪部分",
-      "要我继续", "我可以继续", "如果需要我可以",
-    }) then
+    or text_has_any(text, { "需要你确认", "请确认" }) then
     return true
   end
   return text_has_any(text, {
-    "如果你愿意", "如果你要", "你要的话", "下一步", "我可以继续",
-    "我就直接", "我再继续", "请把", "发我", "需要你确认",
-    "再查一次", "我再查", "换用", "换个接口", "换一个接口", "再试一次",
-    "改用备用", "等待返回",
+    "需要你确认", "请确认", "等待返回",
   })
 end
 
@@ -1239,10 +1221,21 @@ local function lua_code_looks_visual(code)
     or code:find("LVGL", 1, true)
 end
 
+local function quiet_immediate_tool(name)
+  return name == "set_brightness"
+    or name == "set_screen_message"
+    or name == "memory_store"
+    or name == "memory_forget"
+    or name == "wechat_send_image"
+end
+
 local function tool_start_notice(name, args_json)
   local APP = M.APP
   local core = APP.core
   local args = decode_tool_args(args_json)
+  if quiet_immediate_tool(name) then
+    return ""
+  end
   if name == "activate_skill" then
     return ""
   end
@@ -1523,12 +1516,15 @@ local function remember_tool_observations(name, args_json, output)
         if type(s) == "table" then
           remember_observation("lookup_source",
             core.text_or(s.source, "") .. " status=" .. tostring(s.status or "")
+            .. " evidence=" .. core.text_or(s.evidence, s.probe_only and "probe" or "")
+            .. " probe_only=" .. tostring(s.probe_only == true)
             .. " url=" .. core.text_or(s.url, ""))
         end
       end
     elseif core.text_or(doc.url, "") ~= "" then
       remember_observation("lookup_source",
         core.text_or(doc.source, "") .. " status=" .. tostring(doc.status or "")
+        .. " evidence=" .. core.text_or(doc.evidence, "content")
         .. " url=" .. core.text_or(doc.url, ""))
     end
     if type(doc.items) == "table" then
@@ -1582,6 +1578,7 @@ local function lookup_context_text(max_items)
   local lines = {
     "Recent lookup_context:",
     "Use this first for follow-up questions about previous live lookup sources, item numbers, or provenance.",
+    "Sources marked probe_only=true are reachability/status evidence only. Use Items or web_fetch excerpts for page facts.",
     "query=" .. core.text_or(ctx.query, "") .. " kind=" .. core.text_or(ctx.kind, "") .. " at=" .. tostring(ctx.at or 0),
   }
   if #sources > 0 then
@@ -1591,6 +1588,8 @@ local function lookup_context_text(max_items)
       if type(s) == "table" then
         lines[#lines + 1] = "- " .. core.text_or(s.source, "")
           .. " status=" .. tostring(s.status or "")
+          .. " evidence=" .. core.text_or(s.evidence, s.probe_only and "probe" or "")
+          .. " probe_only=" .. tostring(s.probe_only == true)
           .. " title=" .. core.short_text(core.text_or(s.title, ""), 100)
           .. " url=" .. core.text_or(s.url, "")
       end
@@ -1604,6 +1603,7 @@ local function lookup_context_text(max_items)
         lines[#lines + 1] = "- #" .. tostring(item.index or i)
           .. " " .. core.short_text(core.text_or(item.title, ""), 160)
           .. " source=" .. core.text_or(item.source, "")
+          .. " evidence=" .. core.text_or(item.evidence, "content")
       end
     end
   end
@@ -1708,6 +1708,7 @@ local function append_task_policy(parts, task_plan, source, opts)
     parts[#parts + 1] = "For fresh implementation, build the latest request first and ignore unrelated history."
   elseif task_plan.mode == "modify_previous" or task_plan.mode == "debug_previous" then
     parts[#parts + 1] = "For follow-up code/visual work, use only matching recent artifacts or history; preserve the relevant previous program."
+    parts[#parts + 1] = "Interpret the user's complaint semantically: distinguish a request to restore missing behavior from a request to remove behavior. Do not invert the latest request."
   elseif task_plan.needs_history == true then
     parts[#parts + 1] = "Use recent history only when it matches the latest request."
   end
@@ -1717,6 +1718,7 @@ local function append_task_policy(parts, task_plan, source, opts)
     parts[#parts + 1] = "Panel tasks must distinguish code execution success from visible UI confirmation; report queued/timeouts honestly."
     parts[#parts + 1] = "Claw Panel screen is 320x240 pixels; keep every canvas, object, game board, and animation path inside that visible area."
     parts[#parts + 1] = "For visible LVGL objects, set both bg_color and bg_opa=255; objects may be transparent if bg_opa is omitted."
+    parts[#parts + 1] = "Panel Lua runs on a small device: keep games cheap. Pre-create grid/cell objects, update style colors in place, avoid creating/deleting many LVGL objects per tick, avoid large per-frame searches, and use only verified input/timer APIs."
   end
   if opts.force_run_now then
     parts[#parts + 1] = "Enough context has been inspected; perform the concrete tool action now instead of gathering more generic context."
@@ -2618,6 +2620,7 @@ local function completion_self_review(user_text, candidate_text, tool_results, s
     "Require continuation only when requested facts/actions are missing, unsupported, contradicted, or the answer defers after the work should already be complete.",
     "Do not demand more detail just because more detail is possible.",
     "For tool-backed answers, claimed facts must appear in tool outputs or known observations.",
+    "For live lookup, web_probe is only reachability/status evidence. Page contents, lists, prices, model specs, and article facts require web_fetch, lookup_context items, or another content-bearing tool result.",
     "Skill activation, status checks, directory listings, and preflight checks are not enough when the user asked for concrete file contents, code changes, or fetched page contents.",
     "For code/run tasks, the answer should mention the observed success/error and repair path when relevant.",
     "Allowed actions: final, rewrite, continue.",
@@ -2786,6 +2789,51 @@ local function incomplete_final_answer(user_text, source, task_plan, tool_result
     return ""
   end
   return text
+end
+
+local function recoverable_llm_failure_answer(user_text, err, tool_results, task_plan)
+  local APP = M.APP
+  local core = APP.core
+  local lines = {
+    "这轮没有完全完成：模型连接中断，错误是 " .. core.short_text(core.text_or(err, "llm error"), 180) .. "。",
+  }
+  if type(tool_results) == "table" and #tool_results > 0 then
+    lines[#lines + 1] = "但本轮已经拿到了一些工具结果，我不会把这次中断当作正常完成："
+    local start_index = #tool_results - 4 + 1
+    if start_index < 1 then start_index = 1 end
+    for i = start_index, #tool_results do
+      local item = tool_results[i]
+      if type(item) == "table" then
+        local name = core.text_or(item.name, "")
+        local doc = core.safe_json_decode(item.output)
+        if name == "get_panel_artifacts" and type(doc) == "table" then
+          local entries = type(doc.entries) == "table" and doc.entries or {}
+          local title = entries[1] and core.text_or(entries[1].title or entries[1].id, "") or ""
+          lines[#lines + 1] = "- 已读取 Panel 作品" .. (title ~= "" and ("：" .. core.short_text(title, 80)) or "。")
+        elseif name == "get_panel_history" and type(doc) == "table" then
+          local entries = type(doc.entries) == "table" and doc.entries or {}
+          local title = entries[1] and core.text_or(entries[1].title or entries[1].id, "") or ""
+          lines[#lines + 1] = "- 已读取 Panel 历史" .. (title ~= "" and ("：" .. core.short_text(title, 80)) or "。")
+        elseif name == "lua_run" and type(doc) == "table" then
+          if doc.ok == true then
+            local stdout = core.trim(core.text_or(doc.stdout, ""))
+            lines[#lines + 1] = "- lua_run 已成功" .. (stdout ~= "" and ("，输出：" .. core.short_text(stdout:gsub("[\r\n]+", " "), 140)) or "。")
+          else
+            local run_err = core.trim(core.text_or(doc.error, ""))
+            lines[#lines + 1] = "- lua_run 报错：" .. core.short_text(run_err ~= "" and run_err or core.text_or(doc.stdout, ""), 160)
+          end
+        elseif name ~= "" then
+          lines[#lines + 1] = "- 已执行工具：" .. name
+        end
+      end
+    end
+  end
+  if task_is_code_action(task_plan) then
+    lines[#lines + 1] = "下一次你说“继续”时，我会从这些已读作品、错误和工具结果接着修，不会重新把旧错误当成最终回复。"
+  else
+    lines[#lines + 1] = "可以继续追问，我会沿用已经拿到的上下文。"
+  end
+  return table.concat(lines, "\n")
 end
 
 local function observed_paths_snapshot(max_items)
@@ -3072,6 +3120,17 @@ local function apply_task_plan_policy(plan, fallback, user_text, source)
     end
   end
 
+  if fallback.text_first_request ~= true
+    and task_is_code_action(fallback)
+    and fallback.execution_required == true
+    and (mode == "answer" or mode == "code_review") then
+    mode = core.text_or(fallback.mode, "modify_previous")
+    target = core.text_or(fallback.target, target ~= "unknown" and target or "service")
+    needs_history = fallback.needs_history == true
+    execution_required = true
+    allow_text_only = false
+  end
+
   if fallback.text_first_request == true then
     mode = fallback.has_code_context and "code_review" or "answer"
     execution_required = false
@@ -3154,6 +3213,7 @@ local function model_route_task(user_text, source, fallback)
     "Use answer/code_review when the user asks to discuss, explain, review, or says text first.",
     "Use inspect when the user wants real local app/source/files under /sd/apps to be read.",
     "Use debug_previous with needs_history=true for follow-up failure reports such as a prior visual not rendering, not showing, drawing nothing, errors, or asking why the previous result failed.",
+    "Interpret the latest request semantically. If the user is complaining that expected behavior is absent, route it as restoring or implementing that behavior; only route removal when the user actually asks to remove it.",
     "Use live_lookup when the user needs current external facts such as prices, news, weather, exchange rates, or latest public info.",
     "Words such as today, latest, weather, or price are hints only; choose live_lookup only when the user is really asking for current external facts.",
     "Use panel only for visible UI/LVGL/Canvas/screen visual work; use service for HTTP, files, source reading, and non-UI Lua.",
@@ -3402,6 +3462,12 @@ local function run_agent(user_text, source)
         final_text = fallback_text
         break
       end
+      if #accumulated_tool_results > 0 then
+        core.append_log("warn", core.short_text(err, 120))
+        send_progress_once("模型连接中断：" .. core.short_text(core.text_or(err, ""), 140) .. "；我保留已完成的工具结果。")
+        final_text = recoverable_llm_failure_answer(user_text, err, accumulated_tool_results, task_plan)
+        break
+      end
       return nil, err
     end
     local response_id = core.text_or(resp.id, "")
@@ -3522,22 +3588,18 @@ local function run_agent(user_text, source)
       })
       local model_progress_sent = false
       local step_text = core.trim(response_text(resp))
-      if progress_notices < max_progress_notices and step_text ~= "" then
-        local notice = core.short_text(
-          core.normalize_space(step_text),
-          source and source.channel == "wechat" and 180 or 240)
-        if send_progress_once(notice) then
-          model_progress_sent = true
-          append_ledger({
-            event = "model_progress_text",
-            turn_id = turn_id,
-            text = notice,
-          })
-        end
+      if step_text ~= "" then
+        append_ledger({
+          event = "model_progress_text",
+          turn_id = turn_id,
+          text = core.short_text(core.normalize_space(step_text), 240),
+          surfaced = false,
+        })
       end
       local tool_outputs = {}
       local tool_results = {}
       local finish_after_tool = false
+      local finish_now_text = ""
       local step_context_only = #tool_calls > 0
       local step_lua_success_with_stdout = false
       for i = 1, #tool_calls do
@@ -3555,6 +3617,7 @@ local function run_agent(user_text, source)
         end
         -- 工具执行结果会进入下一轮模型输入，也会被记录到 execution ledger 便于排查。
         local output = APP.tools.execute_tool(name, args, source)
+        local had_lua_error_before = saw_lua_error
         if name == "activate_skill" then
           saw_activate_skill = true
         end
@@ -3573,6 +3636,12 @@ local function run_agent(user_text, source)
         end
         if name == "lua_run" and lua_run_repairable_error_text(output) ~= "" then
           saw_lua_error = true
+        end
+        if name == "lua_run" and had_lua_error_before and lua_run_repairable_error_text(output) == "" then
+          local doc = core.safe_json_decode(output)
+          if type(doc) == "table" and doc.ok == true then
+            send_progress_once("上一个运行错误已修复，新的 lua_run 已成功。")
+          end
         end
         append_ledger({
           event = "tool_result",
@@ -3595,7 +3664,7 @@ local function run_agent(user_text, source)
           and not lua_run_needs_followup(user_text, args, output, task_plan, source) then
           step_lua_success_with_stdout = true
         end
-        if name == "lua_run" and progress_notices < max_progress_notices then
+        if name == "lua_run" then
           local notice = code_error_notice(output)
           if notice ~= "" then
             send_progress_once(notice)
@@ -3616,6 +3685,10 @@ local function run_agent(user_text, source)
         end
         if should_finish then
           finish_after_tool = true
+          local doc = core.safe_json_decode(output)
+          if quiet_immediate_tool(name) and type(doc) == "table" and doc.ok ~= false and reply_hint ~= "" then
+            finish_now_text = reply_hint
+          end
         end
         local call_id = core.text_or(tc.call_id, core.text_or(tc.id, ""))
         if call_id ~= "" then
@@ -3637,6 +3710,10 @@ local function run_agent(user_text, source)
             fallback_text = trace_reply
           end
         end
+      end
+      if finish_now_text ~= "" then
+        final_text = finish_now_text
+        break
       end
       if finish_after_tool then
         input = tool_summary_input(user_text, accumulated_tool_results, source, task_plan)

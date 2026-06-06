@@ -294,6 +294,7 @@ local function route_chat_result(doc)
   end
   return core.json_response("200 OK", {
     ok = true,
+    success = core.text_or(job.status, "") ~= "error",
     job_id = core.text_or(job.id, ""),
     job = chat_job_public(APP, true, job),
     state = core.status_snapshot(),

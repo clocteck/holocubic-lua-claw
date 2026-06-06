@@ -353,13 +353,77 @@ end
 
 local function update_lookup_context(ctx)
   local APP = M.APP
+  local core = APP.core
   local S = ensure_lookup_state()
   S.at = APP.core.now_ms()
-  S.query = APP.core.text_or(ctx.query, S.query or "")
-  S.kind = APP.core.text_or(ctx.kind, S.kind or "")
-  S.sources = type(ctx.sources) == "table" and ctx.sources or {}
-  S.items = type(ctx.items) == "table" and ctx.items or {}
-  S.summary = APP.core.text_or(ctx.summary, "")
+  S.query = core.text_or(ctx.query, S.query or "")
+  S.kind = core.text_or(ctx.kind, S.kind or "")
+  S.sources = type(S.sources) == "table" and S.sources or {}
+  S.items = type(S.items) == "table" and S.items or {}
+  local evidence = core.text_or(ctx.evidence, "content")
+  local source_id = core.text_or(ctx.source_id, "src_" .. tostring(S.at))
+
+  local function source_key(item)
+    return table.concat({
+      core.text_or(item.url, ""),
+      core.text_or(item.source, ""),
+      tostring(item.status or ""),
+      core.text_or(item.title, ""),
+    }, "|")
+  end
+
+  local source_seen = {}
+  for i = 1, #S.sources do
+    source_seen[source_key(S.sources[i])] = true
+  end
+  local sources = type(ctx.sources) == "table" and ctx.sources or {}
+  for i = 1, #sources do
+    local item = sources[i]
+    if type(item) == "table" then
+      local copy = {}
+      for k, v in pairs(item) do copy[k] = v end
+      copy.source_id = core.text_or(copy.source_id, source_id .. "_" .. tostring(i))
+      copy.evidence = core.text_or(copy.evidence, evidence)
+      copy.probe_only = copy.evidence == "probe"
+      local key = source_key(copy)
+      if not source_seen[key] then
+        source_seen[key] = true
+        S.sources[#S.sources + 1] = copy
+      end
+    end
+  end
+  while #S.sources > 12 do
+    table.remove(S.sources, 1)
+  end
+
+  local item_seen = {}
+  for i = 1, #S.items do
+    item_seen[core.text_or(S.items[i].source, "") .. "|" .. core.text_or(S.items[i].url, "") .. "|" .. core.text_or(S.items[i].title, "")] = true
+  end
+  local items = type(ctx.items) == "table" and ctx.items or {}
+  if evidence ~= "probe" then
+    for i = 1, #items do
+      local item = items[i]
+      if type(item) == "table" then
+        local copy = {}
+        for k, v in pairs(item) do copy[k] = v end
+        copy.source_id = core.text_or(copy.source_id, source_id .. "_1")
+        copy.evidence = core.text_or(copy.evidence, "content")
+        local key = core.text_or(copy.source, "") .. "|" .. core.text_or(copy.url, "") .. "|" .. core.text_or(copy.title, "")
+        if not item_seen[key] then
+          item_seen[key] = true
+          S.items[#S.items + 1] = copy
+        end
+      end
+    end
+  end
+  while #S.items > 60 do
+    table.remove(S.items, 1)
+  end
+  for i = 1, #S.items do
+    S.items[i].index = i
+  end
+  S.summary = core.text_or(ctx.summary, "")
 end
 
 local function fetch_url(url, options)
@@ -440,6 +504,7 @@ local function tool_web_probe(args)
     kind = kind,
     sources = sources,
     items = {},
+    evidence = "probe",
     summary = "web_probe checked " .. tostring(#results) .. " source(s)",
   })
   local raw = core.safe_json_encode({
@@ -447,6 +512,9 @@ local function tool_web_probe(args)
     query = query,
     kind = kind,
     results = results,
+    sources = sources,
+    evidence = "probe",
+    probe_only = true,
     guidance = "A single failed URL does not prove the device is offline. Compare the statuses and continue with reachable sources.",
   })
   return raw or "{\"ok\":true}"
@@ -476,6 +544,7 @@ local function tool_web_fetch(args)
   update_lookup_context({
     query = query,
     kind = kind,
+    source_id = "fetch_" .. tostring(core.now_ms()),
     sources = {
       {
         url = r.url,
@@ -484,9 +553,11 @@ local function tool_web_fetch(args)
         ok = r.ok,
         title = r.title,
         error = r.error,
+        evidence = "content",
       },
     },
     items = items,
+    evidence = "content",
     summary = r.ok and ("web_fetch " .. r.source .. " ok") or ("web_fetch " .. r.source .. " failed"),
   })
   local raw = core.safe_json_encode({
@@ -499,6 +570,7 @@ local function tool_web_fetch(args)
     bytes = r.bytes,
     error = r.error,
     items = items,
+    evidence = "content",
     guidance = "Answer from title/excerpt/items and cite the concise source name. Do not claim more than this page supports.",
   })
   return raw or "{\"ok\":false,\"error\":\"web_fetch encode failed\"}"
@@ -516,7 +588,7 @@ local function tool_lookup_context(args)
     sources = S.sources,
     items = S.items,
     summary = core.text_or(S.summary, ""),
-    guidance = "Use this for follow-up questions such as item numbers, source questions, or details from the previous live lookup.",
+    guidance = "Use this for follow-up questions such as item numbers, source questions, or details from previous live lookups. Sources with probe_only=true are reachability evidence only; use content items for page facts.",
   })
   return raw or "{\"ok\":true}"
 end
