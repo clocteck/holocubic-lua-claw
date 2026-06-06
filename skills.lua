@@ -2,6 +2,29 @@ local M = {}
 
 local MAX_SKILL_BYTES = 12 * 1024
 local MAX_SKILL_PROMPT_CHARS = 5200
+local CACHE_TTL_MS = 5000
+
+local skill_cache = {}
+local catalog_cache = nil
+local catalog_cache_ms = 0
+
+local function now_ms()
+  if M.APP and M.APP.core and M.APP.core.now_ms then
+    return M.APP.core.now_ms()
+  end
+  return 0
+end
+
+local function cache_fresh(at_ms)
+  local now = now_ms()
+  return now > 0 and tonumber(at_ms) and now - at_ms >= 0 and now - at_ms <= CACHE_TTL_MS
+end
+
+local function clear_cache()
+  skill_cache = {}
+  catalog_cache = nil
+  catalog_cache_ms = 0
+end
 
 -- Skill 根目录，和官方 ESP-Claw 的 /fatfs/skills 布局保持同构。
 local function skills_root()
@@ -106,6 +129,11 @@ local function read_skill(skill_id)
     return nil, "invalid skill id"
   end
 
+  local cached = skill_cache[skill_id]
+  if type(cached) == "table" and cache_fresh(cached.at) then
+    return cached.skill, cached.err
+  end
+
   local path = skill_path(skill_id)
   if file and file.stat then
     local st = file.stat(path)
@@ -127,7 +155,9 @@ local function read_skill(skill_id)
   if #raw > MAX_SKILL_BYTES then
     raw = raw:sub(1, MAX_SKILL_BYTES)
   end
-  return parse_skill(skill_id, raw), nil
+  local skill = parse_skill(skill_id, raw)
+  skill_cache[skill_id] = { at = now_ms(), skill = skill }
+  return skill, nil
 end
 
 local function list_skill_ids()
@@ -147,10 +177,15 @@ local function list_skill_ids()
   return ids
 end
 
--- 每次构造上下文时重新扫描目录，方便通过 DevTools 热更新或新增 Skill。
+-- Skill 目录支持 DevTools 热更新；这里用短 TTL 缓存，避免每轮 prompt 重复扫 SD。
 local function load_catalog()
   local APP = M.APP
   local S = ensure_state()
+  if type(catalog_cache) == "table" and cache_fresh(catalog_cache_ms) then
+    S.loaded = #catalog_cache
+    return catalog_cache
+  end
+
   local catalog = {}
   local ids = list_skill_ids()
   for i = 1, #ids do
@@ -169,6 +204,8 @@ local function load_catalog()
     end
   end
   S.loaded = #catalog
+  catalog_cache = catalog
+  catalog_cache_ms = now_ms()
   return catalog
 end
 
@@ -319,6 +356,7 @@ function M.init(APP)
     is_group_active = is_group_active,
     build_context = build_context,
     clear_session = clear_session,
+    clear_cache = clear_cache,
     snapshot = snapshot,
   }
 end

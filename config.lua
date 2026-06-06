@@ -133,6 +133,17 @@ function M.init(APP)
       last_launch_ms = 0,
     },
     wechat_poll_started_ms = 0,
+    chat_runtime = {
+      max_running = 2,
+      running = 0,
+      queued = 0,
+      active_sessions = {},
+    },
+    tool_lock = {
+      active = false,
+      owner = "",
+      since_ms = 0,
+    },
     wechat_qr = {
       active = false,
       completed = false,
@@ -149,6 +160,8 @@ function M.init(APP)
   }
 
   APP.history = {}
+  APP.histories = {}
+  APP.sessions = {}
   APP.chat_jobs = {}
   APP.chat_job_order = {}
   APP.ui = {}

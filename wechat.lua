@@ -676,6 +676,34 @@ local function seen_message(id)
   return false
 end
 
+local function submit_wechat_chat(prompt, source)
+  local APP = M.APP
+  local core = APP.core
+  if not APP.web or not APP.web.submit_chat_job then
+    return false, "chat queue unavailable"
+  end
+  local job, err = APP.web.submit_chat_job(prompt, source, {
+    on_done = function(done_job, reply, run_err)
+      local chat_id = core.text_or(source.chat_id, "")
+      if chat_id == "" then
+        return
+      end
+      local text = reply
+      if not text or text == "" then
+        text = "ESP Claw error: " .. core.short_text(run_err or (done_job and done_job.error) or "agent failed", 180)
+      end
+      local ok, send_err = send_text(chat_id, text)
+      if not ok then
+        core.append_log("error", send_err or "wechat send failed")
+      end
+    end,
+  })
+  if not job then
+    return false, err or "chat queue failed"
+  end
+  return true, job
+end
+
 -- 处理一条微信消息：抽文本、调用 agent、回发。
 local function handle_msg(msg)
   local APP = M.APP
@@ -737,19 +765,18 @@ local function handle_msg(msg)
 
     if image_path ~= "" then
       local prompt = text ~= "" and text or "请简要描述这张图片。"
-      local reply, err = APP.agent.handle_user_message(prompt, {
+      local ok_submit, submit_err = submit_wechat_chat(prompt, {
         channel = "wechat",
         chat_id = chat_id,
         sender_id = from_user_id,
         message_id = core.text_or(msg.message_id, ""),
         image_path = image_path,
       })
-      if not reply then
-        reply = "图片已收到，但我暂时看不了：" .. core.short_text(err, 160)
-      end
-      local ok, send_err = send_text(chat_id, reply)
-      if not ok then
-        core.append_log("error", send_err or "wechat send failed")
+      if not ok_submit then
+        local ok, send_err = send_text(chat_id, "图片已收到，但任务排队失败：" .. core.short_text(submit_err, 160))
+        if not ok then
+          core.append_log("error", send_err or "wechat send failed")
+        end
       end
       return
     end
@@ -771,18 +798,17 @@ local function handle_msg(msg)
     return
   end
 
-  local reply, err = APP.agent.handle_user_message(text, {
+  local ok_submit, submit_err = submit_wechat_chat(text, {
     channel = "wechat",
     chat_id = chat_id,
     sender_id = from_user_id,
     message_id = core.text_or(msg.message_id, ""),
   })
-  if not reply then
-    reply = "ESP Claw error: " .. core.short_text(err, 180)
-  end
-  local ok, send_err = send_text(chat_id, reply)
-  if not ok then
-    core.append_log("error", send_err or "wechat send failed")
+  if not ok_submit then
+    local ok, send_err = send_text(chat_id, "ESP Claw error: " .. core.short_text(submit_err, 180))
+    if not ok then
+      core.append_log("error", send_err or "wechat send failed")
+    end
   end
 end
 
@@ -804,10 +830,6 @@ local function poll_once()
       return
     end
   end
-  if S.busy then
-    return
-  end
-
   S.wechat_inflight = true
   S.wechat_poll_started_ms = now
   local root = {

@@ -88,7 +88,17 @@ local function tool_set_brightness(args)
 end
 
 -- 激活一个 Skill，并把 Skill 文档作为工具输出交还给模型继续执行。
-local function tool_activate_skill(args)
+local function source_or_last(source)
+  local APP = M.APP
+  local core = APP.core
+  source = type(source) == "table" and source or {}
+  return {
+    channel = core.text_or(source.channel, APP.state.last_channel ~= "" and APP.state.last_channel or "web"),
+    chat_id = core.text_or(source.chat_id, APP.state.last_chat_id ~= "" and APP.state.last_chat_id or "web"),
+  }
+end
+
+local function tool_activate_skill(args, source)
   local APP = M.APP
   local core = APP.core
   if not APP.skills or not APP.skills.activate then
@@ -98,10 +108,7 @@ local function tool_activate_skill(args)
   if skill_id == "" then
     return "{\"ok\":false,\"error\":\"skill_id is required\"}"
   end
-  local ok, result = APP.skills.activate(skill_id, {
-    channel = APP.state.last_channel,
-    chat_id = APP.state.last_chat_id,
-  })
+  local ok, result = APP.skills.activate(skill_id, source_or_last(source))
   if not ok then
     return string.format("{\"ok\":false,\"error\":%q}", core.text_or(result, "activate skill failed"))
   end
@@ -703,7 +710,7 @@ local TOOL_DEFS = {
     type = "function",
     ["function"] = {
       name = "get_code_capabilities",
-      description = "Read machine-readable Lua/LVGL capabilities, known APIs, routing rules, and safe call signatures.",
+      description = "Read machine-readable Lua/LVGL capabilities, screen size constraints, known APIs, routing rules, and safe call signatures.",
       parameters = {
         type = "object",
         properties = {},
@@ -787,13 +794,13 @@ local TOOL_DEFS = {
     type = "function",
     ["function"] = {
       name = "lua_run",
-      description = "Run a Lua code snippet on the device with broad access to available Lua modules and filesystem paths.",
+      description = "Run a Lua code snippet on the device. Panel UI code must fit the 320x240 screen and visible LVGL objects need bg_opa=255.",
       parameters = {
         type = "object",
         properties = {
           code = {
             type = "string",
-            description = "Lua code to execute. Print useful observations with print().",
+            description = "Lua code to execute. Print useful observations with print(). For Panel UI, keep all canvas/object/game coordinates within 320x240 and set lv_obj_set_style_bg_opa(obj,255,0) for visible objects.",
           },
           timeout_ms = {
             type = "integer",
@@ -888,6 +895,9 @@ local function tool_is_visible(item, source)
     return false
   end
   if type(source) == "table" and source.disable_activate_skill and name == "activate_skill" then
+    return false
+  end
+  if name == "preflight_lua" then
     return false
   end
   if type(source) == "table" and source.force_lua_run_only and name ~= "lua_run" then
@@ -1053,21 +1063,25 @@ end
 
 -- Responses API 使用扁平 function schema。
 local function response_tool_defs(source)
+  if type(source) == "table" and source.disable_all_tools then
+    return {}
+  end
   local out = {}
-  if not (type(source) == "table" and source.disable_all_tools) then
-    for i = 1, #HOSTED_TOOL_DEFS do
-      out[#out + 1] = HOSTED_TOOL_DEFS[i]
-    end
+  for i = 1, #HOSTED_TOOL_DEFS do
+    out[#out + 1] = HOSTED_TOOL_DEFS[i]
   end
   for i = 1, #TOOL_DEFS do
-    local fn = function_def_for_model(TOOL_DEFS[i])
-    if type(fn) == "table" and tool_is_visible(TOOL_DEFS[i], source) then
-      out[#out + 1] = {
-        type = "function",
-        name = fn.name,
-        description = fn.description,
-        parameters = fn.parameters,
-      }
+    local item = TOOL_DEFS[i]
+    if tool_is_visible(item, source) then
+      local fn = function_def_for_model(item)
+      if type(fn) == "table" then
+        out[#out + 1] = {
+          type = "function",
+          name = fn.name,
+          description = fn.description,
+          parameters = fn.parameters,
+        }
+      end
     end
   end
   return out
@@ -1075,23 +1089,60 @@ end
 
 -- Chat Completions 使用 function 包裹 schema。
 local function chat_tool_defs(source)
+  if type(source) == "table" and source.disable_all_tools then
+    return {}
+  end
   local out = {}
   for i = 1, #TOOL_DEFS do
-    local fn = function_def_for_model(TOOL_DEFS[i])
-    if type(fn) == "table" and tool_is_visible(TOOL_DEFS[i], source) then
-      out[#out + 1] = {
-        type = "function",
-        ["function"] = fn,
-      }
+    local item = TOOL_DEFS[i]
+    if tool_is_visible(item, source) then
+      local fn = function_def_for_model(item)
+      if type(fn) == "table" then
+        out[#out + 1] = {
+          type = "function",
+          ["function"] = fn,
+        }
+      end
     end
   end
   return out
 end
 
--- 执行 LLM 请求的工具调用；所有工具入参都先从 JSON 收口成 Lua table。
-local function execute_tool(name, args_json)
+local function acquire_tool_lock(owner)
   local APP = M.APP
   local core = APP.core
+  APP.state.tool_lock = type(APP.state.tool_lock) == "table" and APP.state.tool_lock or {}
+  local lock = APP.state.tool_lock
+  owner = core.text_or(owner, "tool")
+  local started = core.now_ms()
+  while lock.active do
+    if sys and sys.wait then
+      sys.wait(50)
+    else
+      return false, "tool busy"
+    end
+    if core.now_ms() - started > 120000 then
+      return false, "tool lock timeout"
+    end
+  end
+  lock.active = true
+  lock.owner = owner
+  lock.since_ms = core.now_ms()
+  return true
+end
+
+local function release_tool_lock(owner)
+  local APP = M.APP
+  APP.state.tool_lock = type(APP.state.tool_lock) == "table" and APP.state.tool_lock or {}
+  APP.state.tool_lock.active = false
+  APP.state.tool_lock.owner = ""
+  APP.state.tool_lock.since_ms = 0
+end
+
+local function execute_tool_unlocked(name, args_json, source)
+  local APP = M.APP
+  local core = APP.core
+  local call_source = source_or_last(source)
   local args = {}
   if type(args_json) == "string" and args_json ~= "" then
     local parsed = core.safe_json_decode(args_json)
@@ -1106,7 +1157,7 @@ local function execute_tool(name, args_json)
   core.append_log("tool", name)
 
   if name == "activate_skill" then
-    return tool_activate_skill(args)
+    return tool_activate_skill(args, call_source)
   end
   if name == "get_device_status" then
     return tool_get_device_status(args)
@@ -1120,7 +1171,7 @@ local function execute_tool(name, args_json)
   if name == "memory_store" and APP.memory and APP.memory.add_fact then
     local ok, result = APP.memory.add_fact(core.text_or(args.content, ""), {
       scope = "chat",
-      chat_id = APP.state.last_chat_id,
+      chat_id = call_source.chat_id,
       kind = "tool",
       source = "manual",
       tags = core.text_or(args.tags, ""),
@@ -1134,8 +1185,8 @@ local function execute_tool(name, args_json)
   end
   if name == "memory_recall" and APP.memory and APP.memory.recall then
     local items = APP.memory.recall(core.text_or(args.query, ""), {
-      channel = APP.state.last_channel,
-      chat_id = APP.state.last_chat_id,
+      channel = call_source.channel,
+      chat_id = call_source.chat_id,
     })
     local out = {}
     for i = 1, #items do
@@ -1153,8 +1204,8 @@ local function execute_tool(name, args_json)
   end
   if name == "memory_list" and APP.memory and APP.memory.snapshot then
     local snap = APP.memory.snapshot({
-      channel = APP.state.last_channel,
-      chat_id = APP.state.last_chat_id,
+      channel = call_source.channel,
+      chat_id = call_source.chat_id,
     })
     local raw = core.safe_json_encode(snap)
     return raw or "{\"ok\":true}"
@@ -1162,8 +1213,8 @@ local function execute_tool(name, args_json)
   if name == "memory_forget" and APP.memory and APP.memory.forget_matching then
     local removed = 0
     removed = APP.memory.forget_matching(core.text_or(args.query, ""), {
-      channel = APP.state.last_channel,
-      chat_id = APP.state.last_chat_id,
+      channel = call_source.channel,
+      chat_id = call_source.chat_id,
     })
     return string.format("{\"ok\":true,\"removed\":%d}", tonumber(removed) or 0)
   end
@@ -1204,8 +1255,8 @@ local function execute_tool(name, args_json)
   end
   if name == "inspect_image" and APP.vision and APP.vision.inspect_image then
     local text, err = APP.vision.inspect_image(core.text_or(args.path, ""), core.text_or(args.prompt, ""), {
-      channel = APP.state.last_channel,
-      chat_id = APP.state.last_chat_id,
+      channel = call_source.channel,
+      chat_id = call_source.chat_id,
     })
     if not text then
       return string.format("{\"ok\":false,\"error\":%q}", core.text_or(err, "image inspect failed"))
@@ -1215,8 +1266,8 @@ local function execute_tool(name, args_json)
   end
   if name == "wechat_send_image" and APP.wechat and APP.wechat.send_image then
     local chat_id = core.trim(args.chat_id)
-    if chat_id == "" and APP.state.last_channel == "wechat" then
-      chat_id = APP.state.last_chat_id
+    if chat_id == "" and call_source.channel == "wechat" then
+      chat_id = call_source.chat_id
     end
     if chat_id == "" then
       return "{\"ok\":false,\"error\":\"chat_id is required\"}"
@@ -1229,13 +1280,32 @@ local function execute_tool(name, args_json)
   end
   if name == "self_check" and APP.diagnostics and APP.diagnostics.run then
     local result = APP.diagnostics.run({
-      channel = APP.state.last_channel,
-      chat_id = APP.state.last_chat_id,
+      channel = call_source.channel,
+      chat_id = call_source.chat_id,
     })
     local raw = core.safe_json_encode(result)
     return raw or "{\"ok\":true}"
   end
   return string.format("{\"ok\":false,\"error\":\"unknown tool %s\"}", core.text_or(name, ""))
+end
+
+-- 执行 LLM 请求的工具调用；所有工具入参都先从 JSON 收口成 Lua table。
+local function execute_tool(name, args_json, source)
+  local APP = M.APP
+  local core = APP.core
+  local owner_source = source_or_last(source)
+  local owner = core.text_or(owner_source.channel, "web") .. ":" .. core.text_or(owner_source.chat_id, "")
+    .. ":" .. core.text_or(name, "tool")
+  local ok_lock, lock_err = acquire_tool_lock(owner)
+  if not ok_lock then
+    return string.format("{\"ok\":false,\"error\":%q}", core.text_or(lock_err, "tool lock failed"))
+  end
+  local ok, result = pcall(execute_tool_unlocked, name, args_json, owner_source)
+  release_tool_lock(owner)
+  if ok then
+    return result
+  end
+  return string.format("{\"ok\":false,\"error\":%q}", core.text_or(result, "tool failed"))
 end
 
 -- 根据工具结果生成低成本确认文案。

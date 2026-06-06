@@ -5,6 +5,13 @@
     "rule": "LVGL/UI code runs on Claw Panel; non-UI Lua runs in ESP Claw service.",
     "panel_markers": ["lv_", "LV_", "lvgl", "LVGL", "ui_scr_act", "ui_clear"]
   },
+  "screen": {
+    "width": 320,
+    "height": 240,
+    "rule": "Claw Panel visible area is 320x240 pixels. Keep every object, canvas, game board, and animation path within x=0..319 and y=0..239.",
+    "layout": "Before drawing grids/games, compute cols*cell_size and rows*cell_size plus margins so they fit inside 320x240. Do not use oversized boards such as 10x20 cells at 18px tall.",
+    "canvas": "Main canvas should usually be 320x240 or smaller. Avoid drawing a large filled rectangle after cells because it can cover the board; draw borders with lines or thin rectangles."
+  },
   "lua_modules": ["tmr", "file", "wifi", "net", "httpd", "http", "uart", "i2s", "websocket", "app", "sys"],
   "serialization": {
     "json": "Do not use require(\"json\") or require(\"sjson\") in lua_run code; those modules are not loadable by require in this environment. For small JSON output, build the string with string.format/table.concat."
@@ -17,6 +24,8 @@
   "lvgl": {
     "colors": "Use 0xRRGGBB numbers directly; lv_color_hex is not available.",
     "integer_pixels": true,
+    "line_points": "lv_line_set_points keeps the point array; store points in a persistent table and mutate it. Do not pass an inline {...} table.",
+    "visibility": "For visible LVGL objects, setting bg_color is not enough; also call lv_obj_set_style_bg_opa(obj,255,0). Balls, dots, background blocks, and panels may be transparent without bg_opa.",
     "functions": {
       "lv_scr_act": true,
       "lv_layer_top": true,

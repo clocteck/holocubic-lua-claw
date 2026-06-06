@@ -145,6 +145,7 @@ pre{margin:0;white-space:pre-wrap;word-break:break-word;background:var(--input);
         <button class="tab active" data-view="promptView" type="button">Prompt</button>
         <button class="tab" data-view="memoryView" type="button">Memory</button>
         <button class="tab" data-view="skillsView" type="button">Skills</button>
+        <button class="tab" data-view="sessionsView" type="button">Sessions</button>
         <button class="tab" data-view="panelView" type="button">Panel</button>
         <button class="tab" data-view="checkView" type="button">Check</button>
       </div>
@@ -198,6 +199,16 @@ pre{margin:0;white-space:pre-wrap;word-break:break-word;background:var(--input);
         <div class="cols">
           <div><div class="mini">Catalog</div><div id="skillsCatalog" class="list"></div></div>
           <div><div class="mini">Active</div><div id="skillsActive" class="list"></div></div>
+        </div>
+      </section>
+      <section id="sessionsView" class="view">
+        <div class="toolbar">
+          <button id="sessionsRefresh" class="primary" type="button">Refresh</button>
+          <button id="sessionClear" class="danger" type="button">Clear Selected</button>
+        </div>
+        <div class="cols">
+          <div><div class="mini">Sessions</div><div id="sessionsList" class="list"></div></div>
+          <div><div class="mini">History</div><div id="sessionHistory" class="list"></div></div>
         </div>
       </section>
       <section id="panelView" class="view">
@@ -283,9 +294,19 @@ pre{margin:0;white-space:pre-wrap;word-break:break-word;background:var(--input);
 <script>
 const BASE="__BASE__";
 const $=id=>document.getElementById(id);
+function tabId(){
+  let id=sessionStorage.getItem("espClawTabId");
+  if(!id){
+    id="tab-"+Date.now().toString(36)+"-"+Math.random().toString(36).slice(2,8);
+    sessionStorage.setItem("espClawTabId",id);
+  }
+  return id;
+}
+const CHAT_ID=tabId();
 const messages=[];
 const seenProgress=new Set();
 let progressReady=false;
+let selectedSessionKey="";
 function showError(text){$("error").textContent=text||""}
 function addMsg(role,text){
   messages.push({role,text});
@@ -325,7 +346,7 @@ async function api(action,payload,opts){
     res=await fetch(BASE+"/api",{
     method:"POST",
     headers:{"Content-Type":"application/json"},
-      body:JSON.stringify(Object.assign({action},payload||{})),
+      body:JSON.stringify(Object.assign({action,channel:"web",chat_id:CHAT_ID},payload||{})),
       signal:controller?controller.signal:undefined
     });
   }finally{
@@ -361,6 +382,7 @@ function activateView(id){
   if(id==="promptView")loadPromptPreview().catch(err=>showError(err.message||String(err)));
   if(id==="memoryView")loadMemory().catch(err=>showError(err.message||String(err)));
   if(id==="skillsView")loadSkills().catch(err=>showError(err.message||String(err)));
+  if(id==="sessionsView")loadSessions().catch(err=>showError(err.message||String(err)));
   if(id==="panelView")loadPanelHistory().catch(err=>showError(err.message||String(err)));
   if(id==="checkView")runSelfCheck().catch(err=>showError(err.message||String(err)));
 }
@@ -429,15 +451,63 @@ async function loadSkills(){
   });
   if(!(data.active||[]).length)emptyList("skillsActive","No active skills");
 }
+function sessionTitle(sess){
+  const title=sess.title||sess.key||"session";
+  const channel=sess.channel||"";
+  const mark=sess.key===("web:"+CHAT_ID)?"current":"";
+  return title+(channel?(" · "+channel):"")+(mark?" · "+mark:"");
+}
+async function loadSessionHistory(key){
+  selectedSessionKey=key||selectedSessionKey;
+  if(!selectedSessionKey){emptyList("sessionHistory","Select a session");return;}
+  const data=await api("session_history",{key:selectedSessionKey,limit:80});
+  const box=$("sessionHistory");box.innerHTML="";
+  const items=data.messages||[];
+  if(!items.length){emptyList("sessionHistory","No messages");return;}
+  items.forEach(msg=>{
+    const el=makeItem(msg.role==="assistant"?"ok":"");
+    const p=document.createElement("p");
+    p.textContent=(msg.role||"message")+": "+(msg.content||"");
+    el.appendChild(p);
+    if(msg.at)addMeta(el,[String(msg.at)]);
+    box.appendChild(el);
+  });
+}
+async function loadSessions(){
+  const data=await api("sessions_list");
+  const box=$("sessionsList");box.innerHTML="";
+  const items=data.sessions||[];
+  if(!items.length){
+    emptyList("sessionsList","No sessions");
+    emptyList("sessionHistory","No session selected");
+    return;
+  }
+  if(!selectedSessionKey)selectedSessionKey=items[0].key;
+  items.forEach(sess=>{
+    const el=makeItem(sess.key===selectedSessionKey?"ok":"");
+    const p=document.createElement("p");
+    p.textContent=sessionTitle(sess);
+    el.appendChild(p);
+    addMeta(el,[
+      sess.key||"",
+      "messages "+(sess.messages||0),
+      sess.last_text||""
+    ].filter(Boolean));
+    el.addEventListener("click",()=>loadSessionHistory(sess.key).then(loadSessions).catch(err=>showError(err.message||String(err))));
+    box.appendChild(el);
+  });
+  await loadSessionHistory(selectedSessionKey);
+}
 async function loadPanelHistory(){
   const data=await api("panel_history",{limit:12});
   const box=$("panelHistory");box.innerHTML="";
   const items=data.entries||[];
   if(!items.length){emptyList("panelHistory","No panel runs");setPre("panelDetail","");return;}
   items.forEach(item=>{
-    const el=makeItem(item.ok?"ok":"fail");
+    const state=item.queued?"queued":(item.ok?"ok":"failed");
+    const el=makeItem(item.queued?"warn":(item.ok?"ok":"fail"));
     const p=document.createElement("p");
-    p.textContent=(item.title||"Panel")+" - "+(item.ok?"ok":"failed");
+    p.textContent=(item.title||"Panel")+" - "+state;
     el.appendChild(p);
     addMeta(el,[item.id||"",String(item.code_bytes||0)+" bytes",item.code_checksum||""].filter(Boolean));
     const bar=document.createElement("div");bar.className="toolbar";
@@ -580,14 +650,15 @@ function renderQr(data,canvas){
 function applyState(st){
   $("route").textContent=st.route_base||BASE;
   const job=st.chat_job||{};
+  const rt=st.chat_runtime||{};
   const jobBusy=job.status==="queued"||job.status==="running";
-  $("statusText").textContent=jobBusy?job.status:(st.busy?"busy":(st.last_error?"warn":"ready"));
+  $("statusText").textContent=(rt.running||rt.queued)?("running "+(rt.running||0)+" / queued "+(rt.queued||0)):(jobBusy?job.status:(st.busy?"busy":(st.last_error?"warn":"ready")));
   $("dot").className="dot "+((st.busy||jobBusy)?"busy":(st.last_error?"warn":""));
   $("llmReady").textContent=st.llm_ready?"LLM ready":"LLM missing";
   $("wechatReady").textContent=st.wechat&&st.wechat.enabled?(st.wechat.configured?"WeChat on":"WeChat token"):"WeChat off";
   $("llmReady").className="pill "+(st.llm_ready?"info":"");
   $("wechatReady").className="pill "+(st.wechat&&st.wechat.enabled&&st.wechat.configured?"info":"");
-  $("toolCount").textContent="Tools "+(st.tool_count||0);
+  $("toolCount").textContent="Tools "+(st.tool_count||0)+" · Q "+(rt.queued||0);
   if(st.wechat&&st.wechat.qr)setWechatQrText(st.wechat.qr);
   const logs=$("logs");
   logs.innerHTML="";
@@ -710,6 +781,7 @@ $("composer").addEventListener("submit",async ev=>{
     }else if(data.job_id){
       const reply=await waitForChatJob(data.job_id);
       pending.textContent=reply||"Done.";
+      if(document.getElementById("sessionsView").classList.contains("active"))loadSessions().catch(()=>{});
     }else{
       pending.textContent=data.reply||"Done.";
     }
@@ -750,6 +822,7 @@ $("reset").addEventListener("click",async()=>{
     $("messages").innerHTML="";
     const data=await api("reset");
     applyState(data.state||{});
+    if(document.getElementById("sessionsView").classList.contains("active"))await loadSessions();
   }catch(err){showError(err.message||String(err))}
 });
 document.querySelectorAll(".tab").forEach(btn=>{
@@ -773,6 +846,12 @@ $("profilesSave").addEventListener("click",()=>saveProfiles().catch(err=>showErr
 $("skillsRefresh").addEventListener("click",()=>loadSkills().catch(err=>showError(err.message||String(err))));
 $("skillsClear").addEventListener("click",async()=>{
   try{await api("skills_clear");await loadSkills();await loadPromptPreview();}catch(err){showError(err.message||String(err))}
+});
+$("sessionsRefresh").addEventListener("click",()=>loadSessions().catch(err=>showError(err.message||String(err))));
+$("sessionClear").addEventListener("click",async()=>{
+  if(!selectedSessionKey)return;
+  if(!confirm("Clear selected session history?"))return;
+  try{await api("session_clear",{key:selectedSessionKey});await loadSessions();}catch(err){showError(err.message||String(err))}
 });
 $("panelRefresh").addEventListener("click",()=>loadPanelHistory().catch(err=>showError(err.message||String(err))));
 $("panelClear").addEventListener("click",async()=>{

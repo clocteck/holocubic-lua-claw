@@ -1,20 +1,62 @@
 local M = {}
 
 local route_reset
+local dispatch_chat_jobs
 
-local function ensure_chat_job(APP)
-  APP.state.chat_job = type(APP.state.chat_job) == "table" and APP.state.chat_job or {}
-  local job = APP.state.chat_job
-  job.id = APP.core.text_or(job.id, "")
-  job.status = APP.core.text_or(job.status, "idle")
-  if job.status == "" then
-    job.status = "idle"
+local function safe_session_part(APP, text, fallback)
+  text = APP.core.text_or(text, fallback or "")
+  text = text:gsub("[^%w%._%-]", "_")
+  text = text:gsub("_+", "_")
+  if text == "" or text == "_" then
+    text = fallback or "default"
   end
-  return job
+  if #text > 80 then
+    text = text:sub(1, 80)
+  end
+  return text
 end
 
-local function chat_job_active(job)
-  return type(job) == "table" and (job.status == "queued" or job.status == "running")
+local function job_session_key(APP, source)
+  source = type(source) == "table" and source or {}
+  local channel = APP.core.text_or(source.channel, "web")
+  local chat_id = APP.core.text_or(source.chat_id, channel)
+  return safe_session_part(APP, channel, "web") .. ":" .. safe_session_part(APP, chat_id, channel)
+end
+
+local function normalize_source(APP, source)
+  source = type(source) == "table" and source or {}
+  local channel = APP.core.text_or(source.channel, "web")
+  local chat_id = APP.core.text_or(source.chat_id, channel)
+  return {
+    channel = channel,
+    chat_id = chat_id,
+    sender_id = APP.core.text_or(source.sender_id, ""),
+    message_id = APP.core.text_or(source.message_id, ""),
+    image_path = APP.core.text_or(source.image_path, ""),
+    title = APP.core.text_or(source.title, ""),
+  }
+end
+
+local function ensure_runtime(APP)
+  APP.chat_runtime = type(APP.chat_runtime) == "table" and APP.chat_runtime or {}
+  local rt = APP.chat_runtime
+  rt.max_running = tonumber(rt.max_running) or 2
+  rt.running = tonumber(rt.running) or 0
+  rt.queue = type(rt.queue) == "table" and rt.queue or {}
+  rt.jobs = type(rt.jobs) == "table" and rt.jobs or {}
+  rt.order = type(rt.order) == "table" and rt.order or {}
+  rt.running_by_session = type(rt.running_by_session) == "table" and rt.running_by_session or {}
+  return rt
+end
+
+local function sync_runtime_state(APP)
+  local rt = ensure_runtime(APP)
+  APP.state.chat_runtime = type(APP.state.chat_runtime) == "table" and APP.state.chat_runtime or {}
+  APP.state.chat_runtime.max_running = rt.max_running
+  APP.state.chat_runtime.running = rt.running
+  APP.state.chat_runtime.queued = #rt.queue
+  APP.state.chat_runtime.active_sessions = rt.running_by_session
+  APP.state.busy = (tonumber(APP.state.agent_running) or 0) > 0 or rt.running > 0
 end
 
 local function remember_chat_job(APP, job)
@@ -24,24 +66,30 @@ local function remember_chat_job(APP, job)
   APP.chat_jobs = type(APP.chat_jobs) == "table" and APP.chat_jobs or {}
   APP.chat_job_order = type(APP.chat_job_order) == "table" and APP.chat_job_order or {}
   local id = APP.core.text_or(job.id, "")
+  ensure_runtime(APP).jobs[id] = job
   if not APP.chat_jobs[id] then
     APP.chat_job_order[#APP.chat_job_order + 1] = id
   end
   APP.chat_jobs[id] = job
-  while #APP.chat_job_order > 6 do
+  while #APP.chat_job_order > 40 do
     local old = table.remove(APP.chat_job_order, 1)
     if old ~= APP.core.text_or(APP.state.chat_job and APP.state.chat_job.id, "") then
       APP.chat_jobs[old] = nil
+      ensure_runtime(APP).jobs[old] = nil
     end
   end
 end
 
 local function find_chat_job(APP, id)
   id = APP.core.text_or(id, "")
+  local rt = ensure_runtime(APP)
+  if id ~= "" and rt.jobs[id] then
+    return rt.jobs[id]
+  end
   if id ~= "" and type(APP.chat_jobs) == "table" and APP.chat_jobs[id] then
     return APP.chat_jobs[id]
   end
-  local current = ensure_chat_job(APP)
+  local current = type(APP.state.chat_job) == "table" and APP.state.chat_job or {}
   if id == "" or id == APP.core.text_or(current.id, "") then
     return current
   end
@@ -50,12 +98,16 @@ end
 
 local function chat_job_public(APP, include_reply, job)
   local core = APP.core
-  job = type(job) == "table" and job or ensure_chat_job(APP)
+  job = type(job) == "table" and job or (APP.state.chat_job or {})
   local out = {
     id = core.text_or(job.id, ""),
     status = core.text_or(job.status, "idle"),
     message = core.short_text(job.message or "", 160),
     error = core.short_text(job.error or "", 260),
+    channel = core.text_or(job.channel, ""),
+    chat_id = core.text_or(job.chat_id, ""),
+    session_key = core.text_or(job.session_key, ""),
+    queue_pos = tonumber(job.queue_pos) or 0,
     created_ms = tonumber(job.created_ms or 0) or 0,
     started_ms = tonumber(job.started_ms or 0) or 0,
     finished_ms = tonumber(job.finished_ms or 0) or 0,
@@ -66,57 +118,127 @@ local function chat_job_public(APP, include_reply, job)
   return out
 end
 
-local function schedule_chat_job(APP)
+local function queue_positions(rt)
+  for i = 1, #rt.queue do
+    rt.queue[i].queue_pos = i
+  end
+end
+
+local function finish_chat_job(APP, job, reply, err)
   local core = APP.core
+  local rt = ensure_runtime(APP)
+  job.finished_ms = core.now_ms()
+  if reply then
+    job.status = "done"
+    job.reply = reply
+    job.error = ""
+    core.append_log("job", "chat " .. core.text_or(job.id, "") .. " done")
+  else
+    job.status = "error"
+    job.reply = ""
+    job.error = core.text_or(err, "agent failed")
+    core.append_log("error", "chat job " .. core.short_text(job.error, 140))
+  end
+  rt.running = math.max(0, (tonumber(rt.running) or 1) - 1)
+  rt.running_by_session[job.session_key] = nil
+  remember_chat_job(APP, job)
+  sync_runtime_state(APP)
+  if type(job.on_done) == "function" then
+    pcall(job.on_done, job, reply, err)
+  end
+  APP.ui_api.redraw()
+  dispatch_chat_jobs(APP)
+end
+
+local function start_chat_job(APP, job)
+  local core = APP.core
+  local rt = ensure_runtime(APP)
+  local timer = tmr.create()
+  APP.add_timer(timer)
+  job.status = "running"
+  job.started_ms = core.now_ms()
+  job.error = ""
+  job.queue_pos = 0
+  rt.running = rt.running + 1
+  rt.running_by_session[job.session_key] = job.id
+  APP.state.chat_job = job
+  remember_chat_job(APP, job)
+  sync_runtime_state(APP)
+  core.append_log("job", "chat " .. core.text_or(job.id, "") .. " running")
+  APP.ui_api.redraw()
+  timer:alarm(80, tmr.ALARM_SINGLE or 0, function()
+    pcall(function() timer:stop() end)
+    pcall(function() timer:unregister() end)
+    local ok, reply, err = pcall(APP.agent.handle_user_message, core.text_or(job.message, ""), job.source)
+    if not ok then
+      finish_chat_job(APP, job, nil, reply)
+    else
+      finish_chat_job(APP, job, reply, err)
+    end
+  end)
+  return true
+end
+
+dispatch_chat_jobs = function(APP)
+  local rt = ensure_runtime(APP)
   if not tmr or not tmr.create then
     return false, "timer unavailable"
   end
-  if APP.chat_job_timer then
-    pcall(function() APP.chat_job_timer:stop() end)
-    pcall(function() APP.chat_job_timer:unregister() end)
-    APP.chat_job_timer = nil
+  local started_any = false
+  while rt.running < rt.max_running and #rt.queue > 0 do
+    local pick_index = nil
+    for i = 1, #rt.queue do
+      local job = rt.queue[i]
+      if job.status == "queued" and not rt.running_by_session[job.session_key] then
+        pick_index = i
+        break
+      end
+    end
+    if not pick_index then
+      break
+    end
+    local job = table.remove(rt.queue, pick_index)
+    queue_positions(rt)
+    start_chat_job(APP, job)
+    started_any = true
   end
-  local timer = tmr.create()
-  APP.chat_job_timer = timer
-  APP.add_timer(timer)
-  -- Web 请求先返回 202，真正的 LLM 对话放到单次 timer 里执行，避免 HTTP handler 长时间占住。
-  timer:alarm(600, tmr.ALARM_SINGLE or 0, function()
-    pcall(function() timer:stop() end)
-    pcall(function() timer:unregister() end)
-    if APP.chat_job_timer == timer then
-      APP.chat_job_timer = nil
-    end
-    local job = ensure_chat_job(APP)
-    if job.status ~= "queued" then
-      return
-    end
-    job.status = "running"
-    job.started_ms = core.now_ms()
-    job.error = ""
-    core.append_log("job", "chat " .. core.text_or(job.id, "") .. " running")
-    APP.ui_api.redraw()
+  sync_runtime_state(APP)
+  return true, started_any
+end
 
-    local reply, err = APP.agent.handle_user_message(core.text_or(job.message, ""), {
-      channel = core.text_or(job.channel, "web"),
-      chat_id = core.text_or(job.chat_id, "web"),
-    })
-    job.finished_ms = core.now_ms()
-    if reply then
-      job.status = "done"
-      job.reply = reply
-      job.error = ""
-      remember_chat_job(APP, job)
-      core.append_log("job", "chat " .. core.text_or(job.id, "") .. " done")
-    else
-      job.status = "error"
-      job.reply = ""
-      job.error = core.text_or(err, "agent failed")
-      remember_chat_job(APP, job)
-      core.append_log("error", "chat job " .. core.short_text(job.error, 140))
-    end
-    APP.ui_api.redraw()
-  end)
-  return true
+local function submit_chat_job(APP, message, source, opts)
+  local core = APP.core
+  if not tmr or not tmr.create then
+    return nil, "timer unavailable"
+  end
+  opts = type(opts) == "table" and opts or {}
+  source = normalize_source(APP, source)
+  local job_id = tostring(core.now_ms()) .. "-" .. tostring(math.random(1000, 9999))
+  local job = {
+    id = job_id,
+    status = "queued",
+    message = core.text_or(message, ""),
+    reply = "",
+    error = "",
+    channel = source.channel,
+    chat_id = source.chat_id,
+    session_key = job_session_key(APP, source),
+    source = source,
+    on_done = opts.on_done,
+    created_ms = core.now_ms(),
+    started_ms = 0,
+    finished_ms = 0,
+    queue_pos = 0,
+  }
+  local rt = ensure_runtime(APP)
+  rt.queue[#rt.queue + 1] = job
+  queue_positions(rt)
+  APP.state.chat_job = job
+  remember_chat_job(APP, job)
+  core.append_log("job", "chat " .. job_id .. " queued " .. job.session_key)
+  dispatch_chat_jobs(APP)
+  APP.ui_api.redraw()
+  return job, nil
 end
 
 -- 处理聊天 API 请求。
@@ -135,51 +257,29 @@ local function route_chat(req)
   if message == "" then
     return core.error_response("400 Bad Request", "message is required")
   end
-  local active = ensure_chat_job(APP)
-  -- 设备端一次只跑一个聊天 job，避免多个 LLM/tool 循环同时写状态和文件。
-  if APP.state.busy or chat_job_active(active) then
-    return core.json_response("202 Accepted", {
-      ok = true,
-      busy = true,
-      job_id = core.text_or(active.id, ""),
-      job = chat_job_public(APP, false),
-      state = core.status_snapshot(),
-    })
-  end
+  local source = normalize_source(APP, {
+    channel = core.text_or(doc.channel, "web"),
+    chat_id = core.text_or(doc.chat_id, "web"),
+    title = core.text_or(doc.title, ""),
+  })
   if doc.reset then
     -- reset 只清当前 Web 会话上下文，不清长期记忆。
-    APP.history = {}
+    if APP.agent and APP.agent.clear_session_history then
+      APP.agent.clear_session_history(source)
+    end
     if APP.skills and APP.skills.clear_session then
-      APP.skills.clear_session({ channel = "web", chat_id = "web" })
+      APP.skills.clear_session(source)
     end
   end
-  local job_id = tostring(core.now_ms()) .. "-" .. tostring(math.random(1000, 9999))
-  APP.state.chat_job = {
-    id = job_id,
-    status = "queued",
-    message = message,
-    reply = "",
-    error = "",
-    channel = "web",
-    chat_id = "web",
-    created_ms = core.now_ms(),
-    started_ms = 0,
-    finished_ms = 0,
-  }
-  remember_chat_job(APP, APP.state.chat_job)
-  local ok_schedule, schedule_err = schedule_chat_job(APP)
-  if not ok_schedule then
-    APP.state.chat_job.status = "error"
-    APP.state.chat_job.error = schedule_err or "chat job schedule failed"
-    return core.error_response("500 Internal Server Error", APP.state.chat_job.error)
+  local job, submit_err = submit_chat_job(APP, message, source)
+  if not job then
+    return core.error_response("500 Internal Server Error", submit_err or "chat job submit failed")
   end
-  core.append_log("job", "chat " .. job_id .. " queued")
-  APP.ui_api.redraw()
   return core.json_response("202 Accepted", {
     ok = true,
     queued = true,
-    job_id = job_id,
-    job = chat_job_public(APP, false),
+    job_id = job.id,
+    job = chat_job_public(APP, false, job),
     state = core.status_snapshot(),
   })
 end
@@ -308,6 +408,36 @@ local function route_api(req)
     end
     return core.json_response("200 OK", APP.skills.snapshot(source))
   end
+  if action == "sessions_list" then
+    if not APP.agent or not APP.agent.sessions_list then
+      return core.error_response("500 Internal Server Error", "session list missing")
+    end
+    local result = APP.agent.sessions_list()
+    result.jobs = {
+      running = APP.state.chat_runtime and APP.state.chat_runtime.running or 0,
+      queued = APP.state.chat_runtime and APP.state.chat_runtime.queued or 0,
+      max_running = APP.state.chat_runtime and APP.state.chat_runtime.max_running or 2,
+    }
+    return core.json_response("200 OK", result)
+  end
+  if action == "session_history" then
+    if not APP.agent or not APP.agent.session_history then
+      return core.error_response("500 Internal Server Error", "session history missing")
+    end
+    return core.json_response("200 OK", APP.agent.session_history(core.text_or(doc.key, ""), doc.limit or 60))
+  end
+  if action == "session_clear" then
+    if not APP.agent or not APP.agent.clear_session_history then
+      return core.error_response("500 Internal Server Error", "session clear missing")
+    end
+    local key = core.text_or(doc.key, "")
+    if key ~= "" then
+      APP.agent.clear_session_history(key)
+    else
+      APP.agent.clear_session_history(source)
+    end
+    return core.json_response("200 OK", { ok = true, sessions = APP.agent.sessions_list().sessions })
+  end
   if action == "panel_history" then
     if not APP.code_runner or not APP.code_runner.panel_history then
       return core.error_response("500 Internal Server Error", "panel history missing")
@@ -325,7 +455,7 @@ local function route_api(req)
       return core.error_response("500 Internal Server Error", "classifier missing")
     end
     local message = core.text_or(doc.message or doc.text, "")
-    local fallback = APP.agent.classify_task(message)
+    local fallback = APP.agent.classify_task(message, source)
     local plan = fallback
     if doc.semantic == true or doc.use_llm == true then
       if not APP.agent.route_task then
@@ -379,7 +509,12 @@ local function route_api(req)
     if not ok then
       return core.error_response("500 Internal Server Error", type(result) == "table" and result.error or result)
     end
-    return core.json_response("200 OK", { ok = true, result = result })
+    return core.json_response("200 OK", {
+      ok = true,
+      queued = type(result) == "table" and result.queued == true,
+      pending = type(result) == "table" and result.pending == true,
+      result = result,
+    })
   end
   if action == "panel_clear" then
     if APP.code_runner and APP.code_runner.panel_history_clear then
@@ -435,10 +570,7 @@ local function route_api(req)
     if not APP.vision or not APP.vision.inspect_image then
       return core.error_response("500 Internal Server Error", "vision module missing")
     end
-    local text, vision_err = APP.vision.inspect_image(core.text_or(doc.path, ""), core.text_or(doc.prompt, "请简要描述这张图片。"), {
-      channel = "web",
-      chat_id = "web",
-    })
+    local text, vision_err = APP.vision.inspect_image(core.text_or(doc.path, ""), core.text_or(doc.prompt, "请简要描述这张图片。"), source)
     if not text then
       local err_text = core.text_or(vision_err, "")
       local base = core.text_or(APP.config and APP.config.llm_base_url, ""):lower()
@@ -469,35 +601,26 @@ local function route_api(req)
     })
   end
   if action == "reset" then
-    return route_reset()
+    return route_reset(source)
   end
   return core.error_response("404 Not Found", "unknown action")
 end
 
 -- 清空会话历史和错误状态。
-route_reset = function()
+route_reset = function(source)
   local APP = M.APP
   local S = APP.state
-  APP.history = {}
+  source = normalize_source(APP, source)
+  if APP.agent and APP.agent.clear_session_history then
+    APP.agent.clear_session_history(source)
+  end
   if APP.skills and APP.skills.clear_session then
-    APP.skills.clear_session({ channel = "web", chat_id = "web" })
+    APP.skills.clear_session(source)
   end
   S.last_error = ""
   S.last_user = ""
   S.last_reply = "Session cleared"
-  S.chat_job = {
-    id = "",
-    status = "idle",
-    message = "",
-    reply = "",
-    error = "",
-    created_ms = 0,
-    started_ms = 0,
-    finished_ms = 0,
-  }
-  APP.chat_jobs = {}
-  APP.chat_job_order = {}
-  APP.core.append_log("session", "cleared")
+  APP.core.append_log("session", "cleared " .. job_session_key(APP, source))
   APP.ui_api.redraw()
   return APP.core.json_response("200 OK", { ok = true, state = APP.core.status_snapshot() })
 end
@@ -592,6 +715,12 @@ function M.init(APP)
   APP.web = {
     start = start,
     unregister_routes = unregister_routes,
+    submit_chat_job = function(message, source, opts)
+      return submit_chat_job(APP, message, source, opts)
+    end,
+    dispatch_chat_jobs = function()
+      return dispatch_chat_jobs(APP)
+    end,
   }
 end
 

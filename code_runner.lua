@@ -212,6 +212,13 @@ local function default_capabilities()
       panel_markers = { "lv_", "LV_", "lvgl", "LVGL", "ui_scr_act", "ui_clear" },
       rule = "LVGL/UI code runs on Claw Panel; non-UI Lua runs in ESP Claw service.",
     },
+    screen = {
+      width = 320,
+      height = 240,
+      rule = "Claw Panel visible area is 320x240 pixels. Keep every object, canvas, game board, and animation path within x=0..319 and y=0..239.",
+      layout = "Before drawing grids/games, compute cols*cell_size and rows*cell_size plus margins so they fit inside 320x240. Do not use oversized boards such as 10x20 cells at 18px tall.",
+      canvas = "Main canvas should usually be 320x240 or smaller. Avoid drawing a large filled rectangle after cells because it can cover the board; draw borders with lines or thin rectangles.",
+    },
     lua_modules = { "tmr", "file", "wifi", "net", "httpd", "http", "uart", "i2s", "websocket", "app", "sys" },
     serialization = {
       json = "Do not use require(\"json\") or require(\"sjson\") in lua_run code; those modules are not loadable by require in this environment. For small JSON output, build the string with string.format/table.concat.",
@@ -224,6 +231,8 @@ local function default_capabilities()
     lvgl = {
       colors = "Use 0xRRGGBB numbers directly; lv_color_hex is not available.",
       integer_pixels = true,
+      line_points = "lv_line_set_points keeps the point array; store points in a persistent table and mutate it. Do not pass an inline {...} table.",
+      visibility = "For visible LVGL objects, setting bg_color is not enough; also call lv_obj_set_style_bg_opa(obj,255,0). Balls, dots, background blocks, and panels may be transparent without bg_opa.",
       functions = LVGL_KNOWN,
     },
     canvas = {
@@ -325,6 +334,9 @@ local function preflight(args)
     if code:find("tmr%.create", 1, false) and not code:find("add_timer", 1, true) then
       add_issue(warnings, "warning", "timer_not_registered", "panel animation timers should be wrapped with add_timer(tmr.create())")
     end
+    if code:find("lv_line_set_points%s*%([^%)\n]*%{", 1, false) then
+      add_issue(errors, "error", "temporary_line_points", "lv_line_set_points keeps the point array; use a persistent table such as pts={x1,y1,x2,y2}, mutate pts, then call lv_line_set_points(line, pts, 2)")
+    end
   end
   if code_uses_unknown_lua_module(code, "os") then
     add_issue(errors, "error", "module_unavailable", "os module is not available in Panel")
@@ -363,6 +375,9 @@ local function add_command_trace(out, command_file)
   return out
 end
 
+local collect_api_names
+local infer_artifact_id
+
 -- 读取 panel 运行历史，返回按时间倒序排列的条目。
 local function read_panel_history(include_code, limit)
   local APP = M.APP
@@ -384,8 +399,14 @@ local function read_panel_history(include_code, limit)
   if not include_code then
     for i = 1, #out do
       local code = core.text_or(out[i].code, "")
+      local latest_code = core.text_or(out[i].latest_code, "")
+      local good_code = core.text_or(out[i].current_good_code, "")
       out[i].code_preview = core.utf8_prefix(code:gsub("\r\n", "\n"), 1200)
+      out[i].latest_code_preview = core.utf8_prefix(latest_code:gsub("\r\n", "\n"), 1200)
+      out[i].current_good_code_preview = core.utf8_prefix(good_code:gsub("\r\n", "\n"), 1200)
       out[i].code = nil
+      out[i].latest_code = nil
+      out[i].current_good_code = nil
     end
   end
   return out
@@ -414,26 +435,71 @@ end
 local function save_panel_history(args, code, response)
   local APP = M.APP
   local core = APP.core
+  args = type(args) == "table" and args or {}
   if type(response) ~= "table" or core.text_or(response.target, "") ~= "panel" then
     return
   end
   local entries = read_panel_history(true, PANEL_HISTORY_LIMIT)
   local seq = core.text_or(response.seq, tostring(core.now_ms()))
+  local now = core.now_ms()
+  local code_text = core.text_or(code, "")
+  local checksum = core.text_or(response.code_checksum, code_checksum(code_text))
+  local artifact_id = infer_artifact_id and infer_artifact_id(args, code_text, response) or ("panel_" .. checksum)
+  local prev = nil
+  for i = 1, #entries do
+    local prev_id = core.text_or(entries[i].artifact_id or entries[i].id, "")
+    if prev_id == artifact_id then
+      prev = entries[i]
+      break
+    end
+  end
+  local response_ok = response.ok ~= false
+  local prev_good_code = core.text_or(prev and (prev.current_good_code or prev.code) or "", "")
+  local prev_good_checksum = core.text_or(prev and (prev.current_good_checksum or prev.code_checksum) or "", "")
+  local prev_good_history_id = core.text_or(prev and (prev.current_good_history_id or prev.history_id) or "", "")
+  local prev_good_stdout = core.text_or(prev and (prev.current_good_stdout or prev.stdout) or "", "")
+  local good_code = response_ok and code_text or prev_good_code
+  local good_checksum = response_ok and checksum or prev_good_checksum
+  local good_history_id = response_ok and seq or prev_good_history_id
+  local good_stdout = response_ok and core.utf8_prefix(core.text_or(response.stdout, ""), 1200)
+    or core.utf8_prefix(prev_good_stdout, 1200)
   local entry = {
     id = seq,
     seq = seq,
+    artifact_id = artifact_id,
     title = core.short_text(args.title or "Claw Panel", 80),
+    goal = core.utf8_prefix(core.text_or(args.goal or args.user_goal or (prev and prev.goal) or ""), 500),
+    mode = core.short_text(args.mode or (prev and prev.mode) or "", 40),
+    target = "panel",
     ok = response.ok ~= false,
     queued = response.queued == true,
     error = core.short_text(response.error or response.warning or "", 280),
     stdout = core.utf8_prefix(core.text_or(response.stdout, ""), 2200),
     result = core.short_text(response.result or "", 800),
-    code = code,
-    code_bytes = #core.text_or(code, ""),
-    code_checksum = core.text_or(response.code_checksum, code_checksum(code)),
+    code = code_text,
+    code_bytes = #code_text,
+    code_checksum = checksum,
+    latest_ok = response_ok,
+    latest_error = core.short_text(response.error or response.warning or "", 280),
+    latest_stdout = core.utf8_prefix(core.text_or(response.stdout, ""), 1200),
+    latest_result = core.short_text(response.result or "", 600),
+    latest_code = code_text,
+    latest_code_bytes = #code_text,
+    latest_code_checksum = checksum,
+    current_good_code = good_code,
+    current_good_checksum = good_checksum,
+    current_good_history_id = good_history_id,
+    current_good_updated_ms = response_ok and now or tonumber(prev and prev.current_good_updated_ms or 0) or now,
+    current_good_stdout = good_stdout,
+    APIs = collect_api_names and collect_api_names(good_code) or {},
+    latest_APIs = collect_api_names and collect_api_names(code_text) or {},
+    history_id = good_history_id,
+    latest_history_id = seq,
     elapsed_ms = tonumber(response.elapsed_ms) or 0,
     command_file = core.text_or(response.command_file, ""),
-    created_ms = core.now_ms(),
+    latest_command_file = core.text_or(response.command_file, ""),
+    created_ms = now,
+    updated_ms = now,
   }
   table.insert(entries, 1, entry)
   local ok, err = write_panel_history(entries)
@@ -458,42 +524,82 @@ end
 local function read_artifacts(limit)
   local APP = M.APP
   local core = APP.core
-  local raw = core.read_text_file(artifacts_path())
   local out = {}
   limit = core.clamp(limit or PANEL_HISTORY_LIMIT, 1, PANEL_HISTORY_LIMIT)
-  if raw and raw ~= "" then
-    for line in raw:gmatch("[^\r\n]+") do
-      local item = core.safe_json_decode(line)
-      if type(item) == "table" and core.text_or(item.id, "") ~= "" then
-        out[#out + 1] = item
+  local history = read_panel_history(true, PANEL_HISTORY_LIMIT)
+  local seen = {}
+  for i = 1, #history do
+    local item = history[i]
+    local id = core.text_or(item.artifact_id or item.id, "")
+    if id ~= "" and not seen[id] then
+      seen[id] = true
+      local latest_code = core.text_or(item.latest_code or item.code, "")
+      local good_code = core.text_or(item.current_good_code, "")
+      if good_code == "" and item.ok ~= false then
+        good_code = latest_code
+      end
+      local good_checksum = core.text_or(item.current_good_checksum, "")
+      if good_checksum == "" and good_code ~= "" then
+        good_checksum = core.text_or(item.code_checksum, "")
+      end
+      out[#out + 1] = {
+        id = id,
+        title = core.short_text(item.title or "Claw Panel", 80),
+        goal = core.utf8_prefix(core.text_or(item.goal, ""), 500),
+        mode = core.short_text(item.mode or "", 40),
+        target = "panel",
+        ok = good_code ~= "",
+        latest_ok = item.ok ~= false,
+        queued = item.queued == true,
+        error = core.short_text(good_code ~= "" and "" or (item.error or ""), 280),
+        latest_error = core.short_text(item.error or "", 280),
+        stdout = core.utf8_prefix(core.text_or(item.current_good_stdout or item.stdout, ""), 1200),
+        latest_stdout = core.utf8_prefix(core.text_or(item.latest_stdout or item.stdout, ""), 1200),
+        result = core.short_text(item.result or "", 600),
+        latest_result = core.short_text(item.latest_result or item.result or "", 600),
+        code = good_code,
+        latest_code = latest_code,
+        code_bytes = #good_code,
+        latest_code_bytes = #latest_code,
+        code_checksum = good_checksum,
+        latest_code_checksum = core.text_or(item.latest_code_checksum or item.code_checksum, ""),
+        current_good_code = good_code,
+        current_good_checksum = good_checksum,
+        current_good_history_id = core.text_or(item.current_good_history_id or item.history_id, ""),
+        current_good_updated_ms = tonumber(item.current_good_updated_ms or item.updated_ms or item.created_ms) or 0,
+        current_good_stdout = core.utf8_prefix(core.text_or(item.current_good_stdout or item.stdout, ""), 1200),
+        APIs = item.APIs or (collect_api_names and collect_api_names(good_code) or {}),
+        latest_APIs = item.latest_APIs or (collect_api_names and collect_api_names(latest_code) or {}),
+        history_id = core.text_or(item.current_good_history_id or item.history_id, ""),
+        latest_history_id = core.text_or(item.id or item.seq, ""),
+        command_file = core.text_or(item.command_file, ""),
+        latest_command_file = core.text_or(item.latest_command_file or item.command_file, ""),
+        created_ms = tonumber(item.created_ms) or 0,
+        updated_ms = tonumber(item.updated_ms or item.created_ms) or 0,
+      }
+      if #out >= limit then
+        break
       end
     end
   end
-  while #out > limit do
-    table.remove(out)
+  if #out == 0 then
+    local raw = core.read_text_file(artifacts_path())
+    if raw and raw ~= "" then
+      for line in raw:gmatch("[^\r\n]+") do
+        local item = core.safe_json_decode(line)
+        if type(item) == "table" and core.text_or(item.id, "") ~= "" then
+          out[#out + 1] = item
+          if #out >= limit then
+            break
+          end
+        end
+      end
+    end
   end
   return out
 end
 
-local function write_artifacts(entries)
-  local APP = M.APP
-  local core = APP.core
-  core.ensure_app_dir()
-  entries = type(entries) == "table" and entries or {}
-  while #entries > PANEL_HISTORY_LIMIT do
-    table.remove(entries)
-  end
-  local lines = {}
-  for i = 1, #entries do
-    local raw = core.safe_json_encode(entries[i])
-    if raw then
-      lines[#lines + 1] = raw
-    end
-  end
-  return core.write_text_file(artifacts_path(), table.concat(lines, "\n"))
-end
-
-local function collect_api_names(code)
+collect_api_names = function(code)
   local out = {}
   local seen = {}
   code = M.APP.core.text_or(code, "")
@@ -513,7 +619,7 @@ local function collect_api_names(code)
   return out
 end
 
-local function infer_artifact_id(args, code, response)
+infer_artifact_id = function(args, code, response)
   local core = M.APP.core
   local explicit = core.trim(type(args) == "table" and args.artifact_id or "")
   if explicit ~= "" then
@@ -531,77 +637,6 @@ local function infer_artifact_id(args, code, response)
     return id
   end
   return "panel_" .. code_checksum(code)
-end
-
-local function save_panel_artifact(args, code, response)
-  local APP = M.APP
-  local core = APP.core
-  if type(response) ~= "table" or core.text_or(response.target, "") ~= "panel" then
-    return
-  end
-  local entries = read_artifacts(PANEL_HISTORY_LIMIT)
-  local id = infer_artifact_id(args, code, response)
-  local now = core.now_ms()
-  local prev_index = nil
-  for i = 1, #entries do
-    if core.text_or(entries[i].id, "") == id then
-      prev_index = i
-      break
-    end
-  end
-  local prev = prev_index and entries[prev_index] or {}
-  local response_ok = response.ok ~= false
-  local code_text = core.text_or(code, "")
-  local checksum = core.text_or(response.code_checksum, code_checksum(code))
-  local good_code = response_ok and code_text or core.text_or(prev.current_good_code or prev.code, "")
-  local good_checksum = response_ok and checksum or core.text_or(prev.current_good_checksum or prev.code_checksum, "")
-  local good_history_id = response_ok and core.text_or(response.seq, "") or core.text_or(prev.current_good_history_id or prev.history_id, "")
-  local good_updated_ms = response_ok and now or tonumber(prev.current_good_updated_ms or prev.updated_ms) or now
-  local good_stdout = response_ok and core.utf8_prefix(core.text_or(response.stdout, ""), 1200)
-    or core.utf8_prefix(core.text_or(prev.current_good_stdout or prev.stdout, ""), 1200)
-  local entry = {
-    id = id,
-    title = core.short_text(args.title or prev.title or "Claw Panel", 80),
-    goal = core.utf8_prefix(core.text_or(args.goal or prev.goal or args.user_goal, ""), 500),
-    mode = core.short_text(args.mode or prev.mode or "", 40),
-    target = "panel",
-    ok = good_code ~= "",
-    latest_ok = response_ok,
-    queued = response.queued == true,
-    error = core.short_text(response_ok and "" or (response.error or response.warning or ""), 280),
-    latest_error = core.short_text(response.error or response.warning or "", 280),
-    stdout = good_stdout,
-    latest_stdout = core.utf8_prefix(core.text_or(response.stdout, ""), 1200),
-    result = response_ok and core.short_text(response.result or "", 600) or core.short_text(prev.result or "", 600),
-    latest_result = core.short_text(response.result or "", 600),
-    code = good_code,
-    latest_code = code_text,
-    code_bytes = #good_code,
-    latest_code_bytes = #code_text,
-    code_checksum = good_checksum,
-    latest_code_checksum = checksum,
-    current_good_code = good_code,
-    current_good_checksum = good_checksum,
-    current_good_history_id = good_history_id,
-    current_good_updated_ms = good_updated_ms,
-    current_good_stdout = good_stdout,
-    APIs = collect_api_names(good_code),
-    latest_APIs = collect_api_names(code),
-    history_id = good_history_id,
-    latest_history_id = core.text_or(response.seq, ""),
-    command_file = core.text_or(response.command_file, ""),
-    latest_command_file = core.text_or(response.command_file, ""),
-    created_ms = tonumber(prev.created_ms) or now,
-    updated_ms = now,
-  }
-  if prev_index then
-    table.remove(entries, prev_index)
-  end
-  table.insert(entries, 1, entry)
-  local ok, err = write_artifacts(entries)
-  if not ok then
-    APP.state.panel.last_error = err or "panel artifact save failed"
-  end
 end
 
 local function artifact_matches(item, query)
@@ -871,10 +906,12 @@ local function panel_timeout_response(seq, code, checksum, cmd_file, fresh, stat
     target = "panel",
     seq = seq,
     queued = true,
+    pending = true,
     picked_up = picked_up,
     panel_phase = phase,
     launch_pending = APP.state.panel.launch_pending or false,
     panel_app_id = APP.config.panel_app_id,
+    heartbeat_fresh = fresh == true,
     error = err,
     message = message,
     warning = err,
@@ -917,18 +954,25 @@ local function run_on_panel(args, code, timeout_ms)
   APP.state.panel.last_error = ""
 
   local fresh = panel_heartbeat_fresh()
-  local launched, launch_err = launch_panel_now()
-  if not launched then
-    APP.state.panel.last_error = launch_err
-    return false, add_command_trace(add_code_trace({
-      ok = false,
-      target = "panel",
-      seq = seq,
-      queued = true,
-      panel_app_id = APP.config.panel_app_id,
-      heartbeat_fresh = fresh == true,
-      error = launch_err,
-    }, code, checksum), cmd_file)
+  local launched = true
+  local launch_err = nil
+  local launched_now = false
+  if not fresh then
+    launched, launch_err = launch_panel_now()
+    launched_now = launched == true
+    if not launched then
+      APP.state.panel.last_error = launch_err
+      return false, add_command_trace(add_code_trace({
+        ok = false,
+        target = "panel",
+        seq = seq,
+        queued = true,
+        pending = true,
+        panel_app_id = APP.config.panel_app_id,
+        heartbeat_fresh = fresh == true,
+        error = launch_err,
+      }, code, checksum), cmd_file)
+    end
   end
 
   local wait_budget = fresh and math.min(PANEL_RESULT_WAIT_MS, timeout_ms + 1800)
@@ -938,6 +982,7 @@ local function run_on_panel(args, code, timeout_ms)
     result.target = "panel"
     result.panel_app_id = APP.config.panel_app_id
     result.heartbeat_fresh = fresh == true
+    result.launched_now = launched_now
     add_code_trace(result, code, checksum)
     add_command_trace(result, cmd_file)
     return result.ok ~= false, result
@@ -1027,7 +1072,6 @@ local function run(args)
     }
   end
   save_panel_history(args, code, response)
-  save_panel_artifact(args, code, response)
 
   local S = APP.state.code_runner
   S.runs = (S.runs or 0) + 1
@@ -1081,17 +1125,30 @@ local function panel_history_rerun(id)
   if code == "" then
     return false, { ok = false, error = "history code missing" }
   end
-  return run({
+  local ok, result = run({
     code = code,
     title = "Rerun " .. core.short_text(item.title or item.id, 48),
+    artifact_id = core.text_or(item.artifact_id or item.id, ""),
     timeout_ms = DEFAULT_TIMEOUT_MS,
   })
+  if not ok and type(result) == "table"
+    and result.target == "panel"
+    and result.queued == true
+    and core.text_or(result.error, "") == "panel result timeout" then
+    result.accepted = true
+    result.pending = true
+    return true, result
+  end
+  return ok, result
 end
 
 -- WebUI 清空 panel 历史文件。
 local function panel_history_clear()
   local ok, err = M.APP.core.write_text_file(panel_history_path(), "")
   if ok then
+    pcall(function()
+      M.APP.core.write_text_file(artifacts_path(), "")
+    end)
     M.APP.core.append_log("panel", "history cleared")
   end
   return ok, err

@@ -20,7 +20,7 @@
 - 运行 Lua：`POST /devtools/api/code/run`，正文为 `text/plain; charset=utf-8`
 - DevRun 会写入并启动：`/sd/apps/devrun/main.lua`
 - 用 `print()` 看结果；短探测先跑 DevRun，不直接改 app 源码。
-
+- 不要编译，检查语法没问题就行
 ## App / Service
 
 - 刷新应用：`app.rescan()`
