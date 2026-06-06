@@ -263,6 +263,7 @@ local function classify_task(user_text)
   local core = M.APP.core
   local text = core.text_or(user_text, "")
   local lower = text:lower()
+  -- 先用本地规则给一个保守 fallback，后续 model_route_task 可以再按语义修正。
   local explicit_text_only = text_has_any(text, {
     "说明", "解释", "讲解", "怎么看", "为什么", "原因", "分析一下", "帮我分析",
     "有没有问题", "会有问题吗", "是否合理", "先文字", "只文字", "不要运行",
@@ -361,9 +362,7 @@ local function classify_task(user_text)
   }) or lower:find("lvgl", 1, true) or lower:find("canvas", 1, true)
 
   local mode = "answer"
-  if live_lookup_request and not asks_code then
-    mode = "live_lookup"
-  elseif asks_code then
+  if asks_code then
     if previous_cue and not fresh_creation then
       mode = text_has_any(text, { "报错", "错误", "没显示", "不显示", "看不到", "没画", "没出来", "画不出来", "失败" }) and "debug_previous" or "modify_previous"
     else
@@ -402,6 +401,7 @@ local function classify_task(user_text)
     execution_required = execution_required,
     allow_text_only = allow_text_only,
     text_first_request = text_first_request,
+    live_lookup_hint = live_lookup_request == true,
     confidence = confidence,
     priority = "latest_user_request",
     note = text_first_request
@@ -414,7 +414,9 @@ local function classify_task(user_text)
       and (mode == "new_code"
         and "Fresh implementation: do not replace the request with an unrelated recent artifact."
         or "Use recent artifacts only if they match the current request.")
-      or "Text answer is allowed; code-looking input may be context rather than an execution request."))),
+      or (live_lookup_request
+        and "Possible current-info wording detected, but semantic routing should decide whether live lookup is actually needed."
+        or "Text answer is allowed; code-looking input may be context rather than an execution request.")))),
   }
 end
 
@@ -451,6 +453,20 @@ local function summarize_tool_output(output)
   local doc = core.safe_json_decode(output)
   if type(doc) ~= "table" then
     return { raw = core.short_text(output, 500) }
+  end
+  if type(doc.results) == "table" or type(doc.items) == "table" or core.text_or(doc.source, "") ~= "" then
+    return {
+      ok = doc.ok,
+      status = doc.status,
+      source = core.text_or(doc.source, ""),
+      url = core.text_or(doc.url, ""),
+      title = core.short_text(doc.title or "", 160),
+      excerpt = core.short_text(doc.excerpt or "", 400),
+      results = doc.results,
+      sources = doc.sources,
+      items = doc.items,
+      error = core.short_text(doc.error or "", 300),
+    }
   end
   return {
     ok = doc.ok,
@@ -584,6 +600,17 @@ end
 
 local function response_looks_like_deferral(text)
   text = M.APP.core.text_or(text, "")
+  local lower = text:lower()
+  if lower:find("if you want", 1, true)
+    or lower:find("if needed", 1, true)
+    or lower:find("tell me which", 1, true)
+    or lower:find("which part", 1, true)
+    or text_has_any(text, {
+      "请告诉我具体", "告诉我具体", "需要哪部分", "需要哪个部分", "你要看哪部分",
+      "要我继续", "我可以继续", "如果需要我可以",
+    }) then
+    return true
+  end
   return text_has_any(text, {
     "如果你愿意", "如果你要", "你要的话", "下一步", "我可以继续",
     "我就直接", "我再继续", "请把", "发我", "需要你确认",
@@ -647,12 +674,46 @@ local function lua_run_looks_probe(args_json, output)
   return false
 end
 
+local function lua_run_reads_source_file(args_json, output)
+  local core = M.APP.core
+  local args = {}
+  if type(args_json) == "string" and args_json ~= "" then
+    local parsed = core.safe_json_decode(args_json)
+    if type(parsed) == "table" then args = parsed end
+  elseif type(args_json) == "table" then
+    args = args_json
+  end
+  local doc = core.safe_json_decode(output)
+  if type(doc) ~= "table" or doc.ok ~= true then
+    return false
+  end
+  local stdout = core.trim(core.text_or(doc.stdout, ""))
+  if stdout == "" then
+    return false
+  end
+  local code = core.text_or(args.code, "")
+  if code:find("file%.getcontents%s*%(", 1, false) then
+    return true
+  end
+  if code:find("file%.open%s*%([^,%)]-,%s*['\"]r", 1, false) then
+    return true
+  end
+  if code:find("file%.open%s*%([^,%)]-%)", 1, false)
+    and (code:find(":read%s*%(", 1, false) or code:find("%.read%s*%(", 1, false)) then
+    return true
+  end
+  return false
+end
+
 local function lua_run_needs_followup(user_text, args_json, output, task_plan)
   if type(task_plan) == "table" then
     if task_plan.mode == "live_lookup" then
       local doc = M.APP.core.safe_json_decode(output)
       local stdout = type(doc) == "table" and M.APP.core.trim(M.APP.core.text_or(doc.stdout, "")) or ""
       return stdout == ""
+    end
+    if task_plan.mode == "inspect" then
+      return not lua_run_reads_source_file(args_json, output)
     end
     if task_plan.execution_required ~= true then
       return false
@@ -690,7 +751,11 @@ local function lua_stdout_fallback(output, task_plan)
   if type(task_plan) == "table" and task_plan.mode == "live_lookup" then
     return "查询结果：\n" .. core.short_text(stdout, 1200)
   end
-  return "已拿到工具输出，但模型没有完成总结。原始结果：\n" .. core.short_text(stdout, 1200)
+  local target = core.text_or(doc.target, "")
+  if target == "panel" then
+    return "Panel 代码已运行，输出：\n" .. core.short_text(stdout, 1200)
+  end
+  return "代码已运行，输出：\n" .. core.short_text(stdout, 1200)
 end
 
 local function user_wants_tool_result_answer(text)
@@ -754,6 +819,56 @@ local function lua_run_repairable_error_text(output)
   return text
 end
 
+local function tool_results_fallback_text(tool_results, task_plan)
+  local core = M.APP.core
+  local first_error = ""
+  local last_stdout = ""
+  local last_target = ""
+  local saw_error = false
+  local saw_success = false
+  for i = 1, #(tool_results or {}) do
+    local item = tool_results[i]
+    if type(item) == "table" and item.name == "lua_run" then
+      local doc = core.safe_json_decode(item.output)
+      if type(doc) == "table" then
+        local err = lua_run_repairable_error_text(item.output)
+        if err ~= "" or doc.ok == false then
+          saw_error = true
+          if first_error == "" then
+            first_error = err ~= "" and err or core.text_or(doc.error, "")
+          end
+        elseif doc.ok == true and not lua_run_needs_followup("", item.arguments, item.output, task_plan) then
+          saw_success = true
+          last_target = core.text_or(doc.target, "")
+          last_stdout = core.trim(core.text_or(doc.stdout, ""))
+        end
+      end
+    end
+  end
+  if not saw_success then
+    return ""
+  end
+  local prefix = "代码已运行"
+  if type(task_plan) == "table" and task_plan.mode == "live_lookup" then
+    prefix = "查询已完成"
+  elseif last_target == "panel" then
+    prefix = "Panel 代码已运行"
+  end
+  local parts = {}
+  if saw_error then
+    parts[#parts + 1] = prefix .. "，中间遇到错误后已修复并重新运行成功。"
+    if first_error ~= "" then
+      parts[#parts + 1] = "之前的错误：" .. core.short_text(first_error:gsub("\r\n", "\n"), 180)
+    end
+  else
+    parts[#parts + 1] = prefix .. "成功。"
+  end
+  if last_stdout ~= "" then
+    parts[#parts + 1] = "输出：\n" .. core.short_text(last_stdout, 1200)
+  end
+  return table.concat(parts, "\n")
+end
+
 local function code_error_notice(output)
   local APP = M.APP
   local core = APP.core
@@ -807,6 +922,11 @@ local function progress_limit(source)
     return source and source.channel == "wechat" and 6 or 9
   end
   return source and source.channel == "wechat" and 4 or 6
+end
+
+local function reply_char_limit(source)
+  local APP = M.APP
+  return APP.MAX_REPLY_CHARS
 end
 
 local function send_progress_notice(source, text)
@@ -974,6 +1094,268 @@ local function tool_result_notice(name, args_json, output)
 end
 
 -- 工具调用后的下一轮仍要带上短历史，避免“补充风格/数量”这类短句丢失上下文。
+local function observations()
+  local S = M.APP.state
+  S.agent_observations = type(S.agent_observations) == "table" and S.agent_observations or {}
+  return S.agent_observations
+end
+
+local function remember_observation(kind, text)
+  local APP = M.APP
+  local core = APP.core
+  text = core.trim(text)
+  if text == "" then
+    return
+  end
+  local obs = observations()
+  local key = kind .. "\n" .. text
+  for i = 1, #obs do
+    if obs[i].key == key then
+      obs[i].at = core.now_ms()
+      return
+    end
+  end
+  obs[#obs + 1] = {
+    key = key,
+    kind = kind,
+    text = core.utf8_prefix(text, 900),
+    at = core.now_ms(),
+  }
+  while #obs > 36 do
+    table.remove(obs, 1)
+  end
+end
+
+local function collect_abs_paths(value, out, seen)
+  out = out or {}
+  seen = seen or {}
+  if type(value) == "string" then
+    for path in value:gmatch("(/sd/[%w_%.%-%+/]+)") do
+      if not seen[path] then
+        seen[path] = true
+        out[#out + 1] = path
+      end
+    end
+  elseif type(value) == "table" then
+    for _, v in pairs(value) do
+      collect_abs_paths(v, out, seen)
+    end
+  end
+  return out
+end
+
+local function infer_listdir_paths(args, output_doc)
+  local APP = M.APP
+  local core = APP.core
+  args = type(args) == "table" and args or {}
+  local code = core.text_or(args.code, "")
+  local base = code:match("file%.listdir%s*%(%s*['\"]([^'\"]+)['\"]")
+    or code:match("file%.list%s*%(%s*['\"]([^'\"]+)['\"]")
+  if not base or base == "" then
+    return
+  end
+  base = base:gsub("/+$", "")
+  local stdout = type(output_doc) == "table" and core.text_or(output_doc.stdout, "") or ""
+  if stdout == "" then
+    return
+  end
+  local count = 0
+  for line in stdout:gmatch("[^\r\n]+") do
+    local trimmed = core.trim(line)
+    if trimmed ~= "" and not trimmed:find("/", 1, true) then
+      for name in trimmed:gmatch("[%w_%.%-]+") do
+        if name ~= "." and name ~= ".." and name ~= "" then
+          remember_observation("path", base .. "/" .. name)
+          count = count + 1
+          if count >= 40 then
+            return
+          end
+        end
+      end
+    end
+  end
+end
+
+local function remember_tool_observations(name, args_json, output)
+  local APP = M.APP
+  local core = APP.core
+  local args = decode_tool_args(args_json)
+  local doc = core.safe_json_decode(output)
+  local paths = collect_abs_paths({ args, doc, output })
+  for i = 1, math.min(#paths, 16) do
+    remember_observation("path", paths[i])
+  end
+  if name == "lua_run" and type(doc) == "table" then
+    infer_listdir_paths(args, doc)
+    local target = core.text_or(doc.target, "")
+    local stdout = core.trim(core.text_or(doc.stdout, ""))
+    local err = core.trim(core.text_or(doc.error, ""))
+    local code = core.text_or(args.code, "")
+    if stdout ~= "" then
+      remember_observation("lua_result", "target=" .. target .. " stdout=" .. core.short_text(stdout, 500))
+    end
+    if err ~= "" then
+      remember_observation("lua_error", "target=" .. target .. " error=" .. core.short_text(err, 500))
+    end
+    if target == "panel" then
+      remember_observation("panel_run", "ok=" .. tostring(doc.ok == true)
+        .. " phase=" .. core.text_or(doc.phase, "")
+        .. " stdout=" .. core.short_text(stdout, 220)
+        .. " error=" .. core.short_text(err, 220)
+        .. " code=" .. core.short_text(code:gsub("\r\n", "\n"), 500))
+    end
+  elseif (name == "get_panel_history" or name == "get_panel_artifacts") and type(doc) == "table" then
+    local entries = type(doc.entries) == "table" and doc.entries or {}
+    for i = 1, math.min(#entries, 5) do
+      local e = entries[i]
+      if type(e) == "table" then
+        remember_observation("panel_context",
+          "id=" .. core.text_or(e.id or e.seq, "")
+          .. " title=" .. core.short_text(core.text_or(e.title, ""), 80)
+          .. " ok=" .. tostring(e.ok ~= false)
+          .. " stdout=" .. core.short_text(core.text_or(e.stdout, ""), 180)
+          .. " error=" .. core.short_text(core.text_or(e.error, ""), 220))
+      end
+    end
+  elseif (name == "web_probe" or name == "web_fetch" or name == "lookup_context") and type(doc) == "table" then
+    if type(doc.sources) == "table" then
+      for i = 1, math.min(#doc.sources, 5) do
+        local s = doc.sources[i]
+        if type(s) == "table" then
+          remember_observation("lookup_source",
+            core.text_or(s.source, "") .. " status=" .. tostring(s.status or "")
+            .. " url=" .. core.text_or(s.url, ""))
+        end
+      end
+    elseif core.text_or(doc.url, "") ~= "" then
+      remember_observation("lookup_source",
+        core.text_or(doc.source, "") .. " status=" .. tostring(doc.status or "")
+        .. " url=" .. core.text_or(doc.url, ""))
+    end
+    if type(doc.items) == "table" then
+      for i = 1, math.min(#doc.items, 8) do
+        local item = doc.items[i]
+        if type(item) == "table" then
+          remember_observation("lookup_item",
+            "#" .. tostring(item.index or i) .. " " .. core.short_text(core.text_or(item.title, ""), 160)
+            .. " source=" .. core.text_or(item.source, ""))
+        end
+      end
+    end
+  elseif name == "activate_skill" and type(doc) == "table" and doc.ok then
+    remember_observation("skill", "activated=" .. core.text_or(doc.skill_id, "") .. " activation_only=true")
+  end
+end
+
+local function observation_context(max_items)
+  local APP = M.APP
+  local core = APP.core
+  local obs = observations()
+  if #obs == 0 then
+    return ""
+  end
+  max_items = tonumber(max_items) or 14
+  local start_index = #obs - max_items + 1
+  if start_index < 1 then start_index = 1 end
+  local lines = {
+    "Known observations from recent tool results:",
+    "Use these observed absolute paths, stdout, errors, and ids instead of guessing or reconstructing them.",
+  }
+  for i = start_index, #obs do
+    lines[#lines + 1] = "- [" .. core.text_or(obs[i].kind, "obs") .. "] " .. core.text_or(obs[i].text, "")
+  end
+  return table.concat(lines, "\n")
+end
+
+local function lookup_context_text(max_items)
+  local APP = M.APP
+  local core = APP.core
+  local ctx = type(APP.state.lookup_context) == "table" and APP.state.lookup_context or nil
+  if not ctx or (type(ctx.sources) ~= "table" and type(ctx.items) ~= "table") then
+    return ""
+  end
+  local sources = type(ctx.sources) == "table" and ctx.sources or {}
+  local items = type(ctx.items) == "table" and ctx.items or {}
+  if #sources == 0 and #items == 0 then
+    return ""
+  end
+  max_items = tonumber(max_items) or 12
+  local lines = {
+    "Recent lookup_context:",
+    "Use this first for follow-up questions about previous live lookup sources, item numbers, or provenance.",
+    "query=" .. core.text_or(ctx.query, "") .. " kind=" .. core.text_or(ctx.kind, "") .. " at=" .. tostring(ctx.at or 0),
+  }
+  if #sources > 0 then
+    lines[#lines + 1] = "Sources:"
+    for i = 1, math.min(#sources, 5) do
+      local s = sources[i]
+      if type(s) == "table" then
+        lines[#lines + 1] = "- " .. core.text_or(s.source, "")
+          .. " status=" .. tostring(s.status or "")
+          .. " title=" .. core.short_text(core.text_or(s.title, ""), 100)
+          .. " url=" .. core.text_or(s.url, "")
+      end
+    end
+  end
+  if #items > 0 then
+    lines[#lines + 1] = "Items:"
+    for i = 1, math.min(#items, max_items) do
+      local item = items[i]
+      if type(item) == "table" then
+        lines[#lines + 1] = "- #" .. tostring(item.index or i)
+          .. " " .. core.short_text(core.text_or(item.title, ""), 160)
+          .. " source=" .. core.text_or(item.source, "")
+      end
+    end
+  end
+  return table.concat(lines, "\n")
+end
+
+local function panel_debug_context(task_plan)
+  local APP = M.APP
+  local core = APP.core
+  if type(task_plan) ~= "table" or task_plan.target ~= "panel" then
+    return ""
+  end
+  if task_plan.mode ~= "debug_previous" and task_plan.mode ~= "modify_previous" then
+    return ""
+  end
+  if not APP.code_runner or not APP.code_runner.panel_history then
+    return ""
+  end
+  local ok, doc = pcall(APP.code_runner.panel_history, 6)
+  if not ok or type(doc) ~= "table" or type(doc.entries) ~= "table" or #doc.entries == 0 then
+    return ""
+  end
+  local lines = {
+    "Recent Panel context packet:",
+    "For debug_previous, prefer the most recent failed panel run. For modify_previous, use the matching prior visual artifact/history.",
+  }
+  for i = 1, math.min(#doc.entries, 5) do
+    local e = doc.entries[i]
+    if type(e) == "table" then
+      if APP.code_runner.panel_history_get then
+        local id = core.text_or(e.id or e.seq, "")
+        if id ~= "" then
+          local ok_detail, detail = pcall(APP.code_runner.panel_history_get, id)
+          if ok_detail and type(detail) == "table" then
+            e = detail
+          end
+        end
+      end
+      local code = core.text_or(e.code, ""):gsub("\r\n", "\n")
+      lines[#lines + 1] =
+        "- id=" .. core.text_or(e.id or e.seq, "")
+        .. " title=" .. core.short_text(core.text_or(e.title, ""), 70)
+        .. " ok=" .. tostring(e.ok ~= false)
+        .. " stdout=" .. core.short_text(core.text_or(e.stdout, ""), 120)
+        .. " error=" .. core.short_text(core.text_or(e.error, ""), 220)
+        .. " code_preview=" .. core.short_text(code, 650)
+    end
+  end
+  return table.concat(lines, "\n")
+end
+
 local function append_recent_conversation(parts, limit)
   local APP = M.APP
   local core = APP.core
@@ -1001,7 +1383,7 @@ local function append_recent_conversation(parts, limit)
 end
 
 -- 无工具回复疑似空转时，让模型自己二次判断该聊天还是该执行。
-local function force_action_input(user_text, previous_text, task_plan)
+local function force_action_input(user_text, previous_text, task_plan, source)
   local APP = M.APP
   local core = APP.core
   local parts = {
@@ -1020,7 +1402,29 @@ local function force_action_input(user_text, previous_text, task_plan)
       parts[#parts + 1] = "Agent task plan: " .. raw_plan
       if task_plan.mode == "inspect" then
         parts[#parts + 1] = "This is a real file/source inspection request. You must activate app_inspect or use service lua_run to inspect files. Do not answer from memory or previous responses."
+        parts[#parts + 1] = "Current agent app root: " .. core.text_or(APP.APP_DIR, "/sd/apps/esp_claw") .. ". For this agent's own files, records, or recent conversation traces, start from this root unless the user names another path."
+        parts[#parts + 1] = "If you have only activated a skill or listed a directory, the task is still incomplete. Use observed paths and the latest user request to decide which relevant files to read next with service lua_run."
       end
+      if task_plan.target == "service" then
+        parts[#parts + 1] = "This is a service-side task. Do not use Panel history/artifacts unless the latest user request explicitly mentions screen, Panel, UI, LVGL, canvas, or a visual artifact."
+      end
+    end
+  end
+  local obs = observation_context(12)
+  if obs ~= "" then
+    parts[#parts + 1] = ""
+    parts[#parts + 1] = obs
+  end
+  local panel_ctx = panel_debug_context(task_plan)
+  if panel_ctx ~= "" then
+    parts[#parts + 1] = ""
+    parts[#parts + 1] = panel_ctx
+  end
+  if APP.skills and APP.skills.build_context then
+    local ok, skills_text = pcall(APP.skills.build_context, source)
+    if ok and type(skills_text) == "string" and skills_text ~= "" then
+      parts[#parts + 1] = ""
+      parts[#parts + 1] = skills_text
     end
   end
   append_recent_conversation(parts, 8)
@@ -1038,10 +1442,19 @@ local function tool_followup_input(user_text, tool_results, source, task_plan, f
   local core = APP.core
   local saw_lua_error = false
   local saw_probe = false
+  local saw_lua_success = false
   for i = 1, #(tool_results or {}) do
     local item = tool_results[i]
     if type(item) == "table" and item.name == "lua_run" and lua_run_repairable_error_text(item.output) ~= "" then
       saw_lua_error = true
+    end
+    if type(item) == "table" and item.name == "lua_run"
+      and lua_run_repairable_error_text(item.output) == ""
+      and not lua_run_needs_followup(user_text, item.arguments, item.output, task_plan) then
+      local doc = M.APP.core.safe_json_decode(item.output)
+      if type(doc) == "table" and doc.ok == true then
+        saw_lua_success = true
+      end
     end
     if type(item) == "table" and item.name == "lua_run" and lua_run_needs_followup(user_text, item.arguments, item.output, task_plan) then
       saw_probe = true
@@ -1052,6 +1465,7 @@ local function tool_followup_input(user_text, tool_results, source, task_plan, f
     "Continue the same user request using these results.",
     "Decide whether the original request still requires execution. If it does, continue with tools; if it is complete, summarize the actual result.",
     "If a tool result contains stdout/data that answers the user's request, write the final user-facing answer now. Do not stop after progress text, and do not call more tools unless the requested information is clearly missing.",
+    "activate_skill only loads operating instructions. It does not inspect files, run code, or complete the user's requested action by itself.",
     "The latest user request has priority over any history or artifact returned by tools.",
     "For Lua app, UI, HTTP, file, or device-code work, code_runner is the execution skill. memory_ops is only for long-term memory requests.",
     "Context and inspection tools such as get_panel_history, get_panel_artifacts, get_code_capabilities, and preflight_lua do not complete an implementation request by themselves.",
@@ -1074,15 +1488,25 @@ local function tool_followup_input(user_text, tool_results, source, task_plan, f
       if task_plan.execution_required == false or task_plan.allow_text_only == true then
         parts[#parts + 1] = "This request may be answered in text. Do not call tools just because the input or previous response contains code-looking text."
       elseif task_plan.mode == "live_lookup" then
-        parts[#parts + 1] = "This is a current external information lookup. Use service/web results to answer the user directly; if stdout is empty after callback-style HTTP, retry with synchronous http.get/http.post and print the status/body."
+        parts[#parts + 1] = "This is a current external information lookup. Prefer web_probe/web_fetch/lookup_context. If one source failed, compare other sources before declaring realtime lookup unavailable."
+        parts[#parts + 1] = "Answer from structured source title/excerpt/items/status and include concise source names. For professional/API/model/spec questions, prefer official pages and compare 2-3 pages when possible."
       elseif task_plan.mode == "new_code" then
         parts[#parts + 1] = "This is a fresh implementation. If a history/artifact tool returned unrelated prior code, ignore it and run the requested new implementation."
+      elseif task_plan.mode == "inspect" then
+        parts[#parts + 1] = "This is an inspection request. If the only successful tool was activate_skill or a directory listing, continue with service lua_run and read the relevant source files. Do not stop after skill activation or listdir."
+        parts[#parts + 1] = "Current agent app root: " .. core.text_or(APP.APP_DIR, "/sd/apps/esp_claw") .. ". For this agent's own files, records, or recent conversation traces, start from this root unless the user names another path."
+        parts[#parts + 1] = "Use the observed directory listing and the user's actual question to choose the next files. Prefer a small set of highly relevant source files over dumping an entire app."
       elseif task_plan.needs_history then
         parts[#parts + 1] = "This looks like a follow-up. Use only matching prior artifacts/history; if none match, continue from the current request rather than a random recent artifact."
       end
+      if task_plan.target == "service" then
+        parts[#parts + 1] = "The target is service. Do not use get_panel_history or get_panel_artifacts unless the latest user request explicitly mentions screen, Panel, UI, LVGL, canvas, or visual artifact."
+      end
     end
   end
-  if saw_lua_error then
+  if saw_lua_error and saw_lua_success then
+    parts[#parts + 1] = "A lua_run error occurred earlier, but a later lua_run succeeded. Summarize the successful stdout/result now; do not call more tools or rerun code."
+  elseif saw_lua_error then
     parts[#parts + 1] = "A lua_run error has already occurred. Treat the original user request as background only; the immediate task is to run corrected code that avoids the failing API or argument pattern."
   end
   if saw_probe then
@@ -1094,6 +1518,21 @@ local function tool_followup_input(user_text, tool_results, source, task_plan, f
       parts[#parts + 1] = ""
       parts[#parts + 1] = skills_text
     end
+  end
+  local obs = observation_context(16)
+  if obs ~= "" then
+    parts[#parts + 1] = ""
+    parts[#parts + 1] = obs
+  end
+  local lookup_ctx = lookup_context_text(12)
+  if lookup_ctx ~= "" then
+    parts[#parts + 1] = ""
+    parts[#parts + 1] = lookup_ctx
+  end
+  local panel_ctx = panel_debug_context(task_plan)
+  if panel_ctx ~= "" then
+    parts[#parts + 1] = ""
+    parts[#parts + 1] = panel_ctx
   end
   parts[#parts + 1] = "Original user request: " .. core.text_or(user_text, "")
   if wants_code_explanation(user_text) then
@@ -1115,6 +1554,7 @@ local function tool_followup_input(user_text, tool_results, source, task_plan, f
       local doc = core.safe_json_decode(item.output)
       if type(doc) == "table" and doc.ok then
         parts[#parts + 1] = "Skill active: " .. core.text_or(doc.skill_id, "") .. ". Full instructions are in the active skill context above."
+        parts[#parts + 1] = "Important: activate_skill is activation_only=true; it did not inspect files, run code, or complete the task. Continue with the concrete tools enabled by this skill."
       else
         parts[#parts + 1] = core.utf8_prefix(core.text_or(item.output, ""), 1200)
       end
@@ -1125,7 +1565,173 @@ local function tool_followup_input(user_text, tool_results, source, task_plan, f
   return table.concat(parts, "\n")
 end
 
+local function tool_summary_input(user_text, tool_results, source, task_plan)
+  local APP = M.APP
+  local core = APP.core
+  local saw_lua_error = false
+  local saw_lua_success = false
+  local parts = {
+    "The requested tool work is complete.",
+    "Do not call tools. Write the final user-facing answer now.",
+    "Use only the tool arguments and outputs below plus known observations. Mention what actually ran or was read.",
+    "If stdout contains the requested marker or data, include it concisely in the answer.",
+    "If an earlier tool call failed but a later tool call succeeded, say it was repaired instead of claiming there were no failures.",
+    "Do not offer to rerun, continue, or wait for confirmation after the requested work is already complete.",
+  }
+  if type(source) == "table" and source.channel == "wechat" then
+    parts[#parts + 1] = "This answer will be sent to WeChat. Be concise and natural. Use short paragraphs if details are needed; do not paste raw stdout or long code."
+  else
+    parts[#parts + 1] = "Summarize the result instead of pasting long raw stdout unless the user explicitly asked for raw output."
+  end
+  local raw_plan = type(task_plan) == "table" and core.safe_json_encode(task_plan) or nil
+  if raw_plan then
+    parts[#parts + 1] = "Agent task plan: " .. raw_plan
+  end
+  if type(task_plan) == "table" and task_plan.mode == "live_lookup" then
+    parts[#parts + 1] = "For realtime lookup summaries, include concise source names and do not claim the whole network is offline based on one failed URL."
+  end
+  local obs = observation_context(12)
+  if obs ~= "" then
+    parts[#parts + 1] = ""
+    parts[#parts + 1] = obs
+  end
+  local lookup_ctx = lookup_context_text(12)
+  if lookup_ctx ~= "" then
+    parts[#parts + 1] = ""
+    parts[#parts + 1] = lookup_ctx
+  end
+  parts[#parts + 1] = ""
+  parts[#parts + 1] = "Original user request: " .. core.text_or(user_text, "")
+  parts[#parts + 1] = ""
+  parts[#parts + 1] = "Completed tool results:"
+  local result_count = #(tool_results or {})
+  local start_index = 1
+  if type(task_plan) == "table" and task_plan.mode == "inspect" and result_count > 4 then
+    start_index = result_count - 3
+  end
+  local output_limit = (type(task_plan) == "table" and task_plan.mode == "inspect") and 2800 or 7000
+  local trace = {}
+  for i = 1, result_count do
+    local item = tool_results[i]
+    if type(item) == "table" and item.name == "lua_run" then
+      local doc = core.safe_json_decode(item.output)
+      if type(doc) == "table" then
+        local err = lua_run_repairable_error_text(item.output)
+        local stdout = core.trim(core.text_or(doc.stdout, ""))
+        if err ~= "" or doc.ok == false then
+          saw_lua_error = true
+          trace[#trace + 1] = tostring(i) .. ". lua_run target=" .. core.text_or(doc.target, "")
+            .. " failed: " .. core.short_text(err ~= "" and err or core.text_or(doc.error, ""), 220)
+        elseif doc.ok == true then
+          saw_lua_success = true
+          trace[#trace + 1] = tostring(i) .. ". lua_run target=" .. core.text_or(doc.target, "")
+            .. " succeeded" .. (stdout ~= "" and (": " .. core.short_text(stdout, 220)) or "")
+        end
+      end
+    end
+  end
+  if #trace > 0 then
+    parts[#parts + 1] = "Execution trace:"
+    for i = 1, math.min(#trace, 8) do
+      parts[#parts + 1] = "- " .. trace[i]
+    end
+    if saw_lua_error and saw_lua_success then
+      parts[#parts + 1] = "Important: there was at least one failed lua_run before a later successful lua_run. Reflect that repair path if relevant."
+    end
+  end
+  for i = start_index, result_count do
+    local item = tool_results[i]
+    if type(item) == "table" then
+      parts[#parts + 1] = "Tool: " .. core.text_or(item.name, "")
+      local arguments = core.text_or(item.arguments, "")
+      if arguments ~= "" then
+        parts[#parts + 1] = "Arguments:"
+        parts[#parts + 1] = core.utf8_prefix(arguments, 5000)
+      end
+      parts[#parts + 1] = "Output:"
+      parts[#parts + 1] = core.utf8_prefix(core.text_or(item.output, ""), output_limit)
+    end
+  end
+  append_recent_conversation(parts, 6)
+  return table.concat(parts, "\n")
+end
+
 -- 按配置限制历史条数。
+local function estimate_tokens(text)
+  text = M.APP.core.text_or(text, "")
+  local ascii = 0
+  for i = 1, #text do
+    if text:byte(i) < 128 then
+      ascii = ascii + 1
+    end
+  end
+  local non_ascii_bytes = #text - ascii
+  return math.ceil((ascii / 4) + (non_ascii_bytes / 2))
+end
+
+local function history_message_limit()
+  local limit = tonumber(M.APP.config.history_message_char_limit) or 2400
+  return M.APP.core.clamp(limit, 400, 12000)
+end
+
+local function history_line(item, limit)
+  local core = M.APP.core
+  item = type(item) == "table" and item or {}
+  local role = core.text_or(item.role, "message")
+  local content = core.text_or(item.content, "")
+  limit = limit or history_message_limit()
+  if #content > limit then
+    content = core.utf8_prefix(content, limit) .. "\n...(truncated in chat history)"
+  end
+  return role .. ": " .. content
+end
+
+local function history_token_total()
+  local total = 0
+  for i = 1, #(M.APP.history or {}) do
+    total = total + estimate_tokens(history_line(M.APP.history[i], history_message_limit()))
+  end
+  return total
+end
+
+local function recent_history_lines(max_tokens)
+  local APP = M.APP
+  local core = APP.core
+  local history = type(APP.history) == "table" and APP.history or {}
+  max_tokens = tonumber(max_tokens) or tonumber(APP.config.history_token_limit) or 8000
+  max_tokens = core.clamp(max_tokens, 200, 60000)
+  local per_message = math.min(history_message_limit(), 2200)
+  local selected = {}
+  local used = 0
+  for i = #history, 1, -1 do
+    local line = history_line(history[i], per_message)
+    local tokens = estimate_tokens(line)
+    if used + tokens > max_tokens then
+      if #selected == 0 then
+        local bytes = core.clamp(max_tokens * 4, 300, per_message)
+        line = core.utf8_prefix(line, bytes) .. "\n...(truncated to fit history budget)"
+        table.insert(selected, 1, line)
+      end
+      break
+    end
+    table.insert(selected, 1, line)
+    used = used + tokens
+  end
+  return selected, used
+end
+
+local function append_recent_history(parts, max_tokens)
+  local lines = recent_history_lines(max_tokens)
+  if #lines == 0 then
+    return
+  end
+  parts[#parts + 1] = "Recent conversation:"
+  for i = 1, #lines do
+    parts[#parts + 1] = lines[i]
+  end
+  parts[#parts + 1] = ""
+end
+
 local function trim_history()
   local APP = M.APP
   local limit = tonumber(APP.config.history_limit) or 0
@@ -1133,8 +1739,23 @@ local function trim_history()
     APP.history = {}
     return
   end
+  local per_message = history_message_limit()
+  for i = 1, #APP.history do
+    local item = APP.history[i]
+    if type(item) == "table" then
+      local content = APP.core.text_or(item.content, "")
+      if #content > per_message then
+        item.content = APP.core.utf8_prefix(content, per_message) .. "\n...(truncated in chat history)"
+      end
+    end
+  end
   local max_messages = limit * 2
   while #APP.history > max_messages do
+    table.remove(APP.history, 1)
+  end
+  local max_tokens = tonumber(APP.config.history_token_limit) or 12000
+  max_tokens = APP.core.clamp(max_tokens, 1000, 60000)
+  while #APP.history > 2 and history_token_total() > max_tokens do
     table.remove(APP.history, 1)
   end
 end
@@ -1160,9 +1781,15 @@ local function response_instructions(source)
     "For Lua app, LVGL UI, HTTP, file, or device-code implementation where execution_required=true, activate code_runner and run code with tools instead of returning a code block as the final answer.",
     "If code_runner is already active in the skill context, call its tools directly; do not activate it again.",
     "Do not activate memory_ops for code/app implementation unless the user explicitly asks for long-term memory.",
-    "Use web search only when the user needs current, external, or verifiable public information.",
-    "Do not use web search for local device state, memory, casual chat, or actions covered by active local skills.",
-    "When web search is used, keep available source links visible in the final answer.",
+    "Use live lookup only when the user needs current, external, or verifiable public information.",
+    "Do not use live lookup for local device state, memory, casual chat, or actions covered by active local skills.",
+    "Do not activate web_search unless that skill exists in the Skills List. If the hosted web_search tool is not present, use the web_search skill instructions and code_runner/lua_run HTTP fallback for live_lookup.",
+    "For live lookup, prefer web_probe, web_fetch, and lookup_context over hand-written HTTP Lua. Use lua_run HTTP only as a fallback when those tools are not available.",
+    "web_probe only checks reachability/status. Use web_fetch when the user asks to read a page, extract titles/items, summarize a page, or discuss specific content.",
+    "When live lookup uses HTTP, answer only from fetched title/excerpt/items/status or stdout/body/status. If one URL fails, try or mention other sources before claiming realtime lookup is unavailable; a single failed URL does not mean the device has no network.",
+    "Realtime answers must include a concise source name, such as Baidu, Zhihu, wttr.in, blockchain.info, or an official docs site.",
+    "For realtime professional/API/model/spec questions, prefer official pages first and compare 2-3 relevant pages when possible before giving a confident answer.",
+    "For follow-up questions about a previous lookup, use lookup_context first before fetching new pages.",
     "For service HTTP lookups in Lua, prefer synchronous calls such as local code, body = http.get(url, {timeout=5000, bufsz=...}) and print the status/body. Avoid callback-style HTTP when the user needs the result in this chat turn, because callback output may not be captured before lua_run returns.",
     "Do not use raw memory files such as memory_records.jsonl, memory_index.json, memory_digest.log, or MEMORY.md as direct decision input.",
     "When execution_required=true or the user clearly asks to implement, build, run, fix, upload, test, or continue an implementation, do the work with skills and tools. If allow_text_only=true, a concise normal answer is acceptable.",
@@ -1176,6 +1803,8 @@ local function response_instructions(source)
     "Do not claim file, image, GPIO, or complex hardware control support unless an active skill or tool declares it.",
     "Never delete directories or broad paths such as /sd. For deleting a single file, ask for explicit confirmation first and do not call tools in the same turn.",
     "When writing device code, do not invent APIs. Use only interfaces declared by active Skill docs or observed in tool results; otherwise probe first or choose a simpler verified API.",
+    "Even when the user asks only for a design or explanation for this device, keep API names consistent with known device capabilities. Do not suggest unverified APIs as if they were available.",
+    "Use Panel history/artifacts only for screen, UI, LVGL, canvas, visual, or Panel follow-ups. For service-side Lua/data/file tasks, use service tools and recent conversation instead.",
     "If the user asks for implementation details, explanation, or how previous code worked, answer from recent conversation and tool results. Do not activate code_runner just to report activation.",
     "When summarizing lua_run, only claim what the tool actually executed: Tool Arguments.code is the submitted code, and Output.stdout/result/error is the observed result.",
     "If a panel lua_run is queued or reports a result timeout, say execution was not confirmed instead of saying the UI is running.",
@@ -1192,6 +1821,7 @@ local function response_user_input(user_text, source, task_plan)
   local APP = M.APP
   local core = APP.core
   local parts = {}
+  -- Prompt 顺序很重要：长期记忆和 Skill catalog 是背景，最新 user 放在最后。
   if APP.memory and APP.memory.build_context then
     local ok, memory_text = pcall(APP.memory.build_context, user_text, source)
     if ok and type(memory_text) == "string" and memory_text ~= "" then
@@ -1214,21 +1844,39 @@ local function response_user_input(user_text, source, task_plan)
       parts[#parts + 1] = "Use artifacts/history only when this plan says needs_history=true, unless the latest user request clearly requires otherwise."
       parts[#parts + 1] = "If text_first_request=true, the user is asking for discussion or analysis first. Let your semantic judgment decide the answer, but do not force tool use merely because code changes are mentioned."
       parts[#parts + 1] = "If execution_required=false or allow_text_only=true, answer normally unless the user clearly asks you to run or modify code. Code snippets may be context for explanation."
+      if task_plan.target == "service" then
+        parts[#parts + 1] = "For service-side tasks, do not use Panel history/artifacts unless the latest user request explicitly mentions screen, Panel, UI, LVGL, canvas, or a visual artifact."
+      end
+      if task_plan.mode == "inspect" then
+        parts[#parts + 1] = "For inspect requests, activating a skill or listing a directory is not enough. Use service lua_run to read relevant source files and summarize observed contents."
+        parts[#parts + 1] = "Current agent app root: " .. core.text_or(APP.APP_DIR, "/sd/apps/esp_claw") .. ". For this agent's own files, records, or recent conversation traces, start from this root unless the user names another path."
+        parts[#parts + 1] = "Choose files from observed paths based on the user's wording. Read only enough source to answer accurately, then summarize what you actually observed."
+      end
+      if task_plan.mode == "live_lookup" then
+        parts[#parts + 1] = "For live lookup, use web_probe/web_fetch for structured source checks. Do not decide the whole network is offline from one failed URL."
+        parts[#parts + 1] = "web_probe is status-only. If the user asks to fetch/read/list items/headlines, call web_fetch or lookup_context before answering."
+        parts[#parts + 1] = "For follow-up lookup questions, first use Recent lookup_context if it answers the user's reference, item number, or source question."
+        parts[#parts + 1] = "Final realtime answers must cite concise source names and should prefer official sources for professional/API/model/spec questions."
+      end
       parts[#parts + 1] = ""
     end
   end
-  if #APP.history > 0 then
-    parts[#parts + 1] = "Recent conversation:"
-    for i = 1, #APP.history do
-      local item = APP.history[i]
-      local role = core.text_or(type(item) == "table" and item.role or "", "message")
-      local content = core.text_or(type(item) == "table" and item.content or "", "")
-      if content ~= "" then
-        parts[#parts + 1] = role .. ": " .. content
-      end
-    end
+  local lookup_ctx = lookup_context_text(12)
+  if lookup_ctx ~= "" and (type(task_plan) ~= "table" or task_plan.mode == "live_lookup" or task_plan.needs_history) then
+    parts[#parts + 1] = lookup_ctx
     parts[#parts + 1] = ""
   end
+  local obs = observation_context(14)
+  if obs ~= "" then
+    parts[#parts + 1] = obs
+    parts[#parts + 1] = ""
+  end
+  local panel_ctx = panel_debug_context(task_plan)
+  if panel_ctx ~= "" then
+    parts[#parts + 1] = panel_ctx
+    parts[#parts + 1] = ""
+  end
+  append_recent_history(parts, math.min(tonumber(APP.config.history_token_limit) or 8000, 8000))
   parts[#parts + 1] = "User: " .. user_text
   return table.concat(parts, "\n")
 end
@@ -1261,17 +1909,7 @@ local function prompt_preview(user_text, source)
   end
 
   local history_parts = {}
-  if #APP.history > 0 then
-    history_parts[#history_parts + 1] = "Recent conversation:"
-    for i = 1, #APP.history do
-      local item = APP.history[i]
-      local role = core.text_or(type(item) == "table" and item.role or "", "message")
-      local content = core.text_or(type(item) == "table" and item.content or "", "")
-      if content ~= "" then
-        history_parts[#history_parts + 1] = role .. ": " .. content
-      end
-    end
-  end
+  append_recent_history(history_parts, math.min(tonumber(APP.config.history_token_limit) or 8000, 8000))
 
   local history_text = table.concat(history_parts, "\n")
   local input = response_user_input(user_text, source, task_plan)
@@ -1455,6 +2093,7 @@ local function call_llm(input, previous_response_id, instructions, source, task_
 
   local body = nil
   if api_kind == "chat" then
+    -- Chat Completions 和 Responses 的工具 schema 不同，这里各自构造请求体。
     local deepseek_thinking = is_deepseek_base() and deepseek_thinking_enabled(task_plan)
     body = {
       model = APP.config.llm_model,
@@ -1473,6 +2112,8 @@ local function call_llm(input, previous_response_id, instructions, source, task_
     end
     if type(body.tools) ~= "table" or #body.tools == 0 then
       body.tools = nil
+    elseif type(source) == "table" and source.force_lua_run_only then
+      body.tool_choice = { type = "function", ["function"] = { name = "lua_run" } }
     end
   else
     body = {
@@ -1484,6 +2125,10 @@ local function call_llm(input, previous_response_id, instructions, source, task_
     }
     if instructions and instructions ~= "" then
       body.instructions = instructions
+    end
+    if type(body.tools) == "table" and #body.tools > 0
+      and type(source) == "table" and source.force_lua_run_only then
+      body.tool_choice = { type = "function", name = "lua_run" }
     end
     if previous_response_id and previous_response_id ~= "" then
       body.previous_response_id = previous_response_id
@@ -1513,10 +2158,28 @@ local function call_llm(input, previous_response_id, instructions, source, task_
   }, raw)
 
   if code ~= 200 then
+    -- 某些模型不接受强制 tool_choice，失败时放宽一次，让模型正常返回。
+    if type(source) == "table" and source.force_lua_run_only and body.tool_choice ~= nil then
+      body.tool_choice = nil
+      local retry_raw, retry_enc_err = core.safe_json_encode(body)
+      if retry_raw then
+        code, resp_body = http.post(url, {
+          headers = headers,
+          timeout = math.min(request_timeout, 20000),
+          bufsz = 131072,
+        }, retry_raw)
+      else
+        return nil, retry_enc_err
+      end
+    end
+  end
+
+  if code ~= 200 then
     local transient = core.text_or(resp_body, ""):find("ESP_ERR_HTTP_INCOMPLETE_DATA", 1, true)
       or core.text_or(resp_body, ""):find("timeout", 1, true)
     if api_kind == "chat" and is_deepseek_base() and transient and type(body.thinking) == "table"
       and body.thinking.type == "enabled" then
+      -- 长推理在嵌入式 HTTP 上偶发不完整，降级为普通回答再试一次。
       body.thinking = { type = "disabled" }
       body.reasoning_effort = nil
       body.max_tokens = 4096
@@ -1556,6 +2219,44 @@ end
 
 -- 完成一轮用户请求，包含可选工具调用。
 -- Removed stale run_agent header from the old mojibake comment.
+local function fit_final_reply(final_text, source, instructions, task_plan)
+  local APP = M.APP
+  local core = APP.core
+  final_text = core.squash_repeated_reply(final_text)
+  local limit = reply_char_limit(source)
+  if #final_text <= limit then
+    return final_text
+  end
+  if type(source) == "table" and source.channel == "wechat" then
+    local input = table.concat({
+      "Rewrite the following assistant answer for WeChat.",
+      "Keep the same facts and outcome, but make it concise and natural.",
+      "Target length: short enough to send in one to three WeChat messages.",
+      "Use short paragraphs when details are necessary.",
+      "Do not add new facts. Do not mention this rewrite instruction.",
+      "",
+      final_text,
+    }, "\n")
+    local compact_source = {}
+    for k, v in pairs(source) do
+      compact_source[k] = v
+    end
+    compact_source.disable_all_tools = true
+    compact_source.router_call = true
+    local ok, resp = pcall(call_llm, input, "", instructions or "", compact_source, task_plan)
+    if ok and type(resp) == "table" then
+      local compact = core.trim(response_text(resp))
+      if compact ~= "" then
+        final_text = core.squash_repeated_reply(compact)
+      end
+    end
+  end
+  if #final_text > limit then
+    final_text = core.short_text(final_text, limit)
+  end
+  return final_text
+end
+
 local function extract_json_object(text)
   local core = M.APP.core
   text = core.trim(text)
@@ -1581,6 +2282,350 @@ local function extract_json_object(text)
     return text:sub(first, last)
   end
   return text
+end
+
+local function completion_tool_facts(tool_results, max_items)
+  local APP = M.APP
+  local core = APP.core
+  tool_results = type(tool_results) == "table" and tool_results or {}
+  max_items = tonumber(max_items) or 8
+  if #tool_results == 0 then
+    return "No tool results were observed in this turn."
+  end
+  local start_index = #tool_results - max_items + 1
+  if start_index < 1 then start_index = 1 end
+  local lines = {}
+  for i = start_index, #tool_results do
+    local item = tool_results[i]
+    if type(item) == "table" then
+      local name = core.text_or(item.name, "")
+      lines[#lines + 1] = "Tool #" .. tostring(i) .. ": " .. name
+      local args = core.text_or(item.arguments, "")
+      if args ~= "" then
+        lines[#lines + 1] = "Arguments: " .. core.utf8_prefix(args:gsub("[\r\n]+", " "), 900)
+      end
+      local output = core.text_or(item.output, "")
+      if name == "lua_run" then
+        local doc = core.safe_json_decode(output)
+        if type(doc) == "table" then
+          local stdout = core.trim(core.text_or(doc.stdout, ""))
+          local err = core.trim(core.text_or(doc.error, ""))
+          lines[#lines + 1] = "Output summary: ok=" .. tostring(doc.ok == true)
+            .. " target=" .. core.text_or(doc.target, "")
+            .. " phase=" .. core.text_or(doc.phase, "")
+            .. " stdout=" .. core.short_text(stdout:gsub("[\r\n]+", " "), 700)
+            .. " error=" .. core.short_text(err:gsub("[\r\n]+", " "), 500)
+        else
+          lines[#lines + 1] = "Output: " .. core.utf8_prefix(output:gsub("[\r\n]+", " "), 1000)
+        end
+      else
+        lines[#lines + 1] = "Output: " .. core.utf8_prefix(output:gsub("[\r\n]+", " "), 1000)
+      end
+    end
+  end
+  return table.concat(lines, "\n")
+end
+
+local function completion_self_review(user_text, candidate_text, tool_results, source, task_plan)
+  local APP = M.APP
+  local core = APP.core
+  if not llm_configured() or not http or not http.post then
+    return nil, "review unavailable"
+  end
+  candidate_text = core.trim(candidate_text)
+  if candidate_text == "" then
+    return nil, "empty candidate"
+  end
+  -- 自审只检查“是否完成”，不允许调用工具，避免额外制造副作用。
+  local plan_raw = type(task_plan) == "table" and core.safe_json_encode(task_plan) or "{}"
+  local instructions = table.concat({
+    "You are a completion auditor for an embedded device agent.",
+    "Return only one compact JSON object. No markdown.",
+    "Judge whether the candidate final answer truly satisfies the latest user request, using tool facts as evidence.",
+    "Do not require extra work just because more detail is possible. Require continuation only when the requested action/facts are missing, unsupported by tool facts, contradicted, or the answer asks the user to continue after the work should already be complete.",
+    "If tool facts show only one failed external URL, do not infer the whole device network is offline unless multiple relevant probes or a clear network-wide error support that conclusion.",
+    "web_probe proves only reachability/status. It does not prove page contents or extracted items. If the candidate lists headlines/items/page details, those exact facts must appear in web_fetch items/excerpt/title, lookup_context items, or another content-bearing tool result.",
+    "For source/file inspection, skill activation or directory listing alone is not enough if the user asked to read specific implementation content.",
+    "For code/run tasks, a final answer should mention the observed success/error from tool facts, especially if a failure was later repaired.",
+    "Allowed actions: final, rewrite, continue.",
+    "Use action=continue only when another model/tool step is needed. Use action=rewrite when the facts are enough but the answer is incomplete, misleading, too deferring, or poorly phrased.",
+    "Schema: {\"complete\":true,\"action\":\"final\",\"reason\":\"short\",\"revised_answer\":\"\",\"continue_instruction\":\"\"}",
+  }, "\n")
+  local input = table.concat({
+    "Latest user request:",
+    core.text_or(user_text, ""),
+    "",
+    "Agent task plan:",
+    plan_raw or "{}",
+    "",
+    "Candidate final answer:",
+    core.utf8_prefix(candidate_text, 2200),
+    "",
+    "Tool facts from this turn:",
+    completion_tool_facts(tool_results, 10),
+    "",
+    "Known observations:",
+    observation_context(10),
+    "",
+    "Recent lookup_context:",
+    lookup_context_text(10),
+  }, "\n")
+  local review_source = {}
+  for k, v in pairs(type(source) == "table" and source or {}) do
+    review_source[k] = v
+  end
+  review_source.disable_all_tools = true
+  review_source.router_call = true
+  review_source.completion_review = true
+  local resp, err = call_llm(input, "", instructions, review_source, {
+    mode = "answer",
+    execution_required = false,
+    allow_text_only = true,
+  })
+  if not resp then
+    return nil, err
+  end
+  local text = response_text(resp)
+  local raw_json = extract_json_object(text)
+  local parsed = raw_json and core.safe_json_decode(raw_json) or nil
+  if type(parsed) ~= "table" then
+    return nil, "review returned non-json"
+  end
+  parsed.action = core.trim(core.text_or(parsed.action, parsed.complete == false and "continue" or "final")):lower()
+  parsed.reason = core.short_text(core.text_or(parsed.reason, ""), 240)
+  parsed.revised_answer = core.trim(core.text_or(parsed.revised_answer, ""))
+  parsed.continue_instruction = core.trim(core.text_or(parsed.continue_instruction, ""))
+  parsed.complete = parsed.complete == true
+  return parsed, nil
+end
+
+local function completion_continue_input(user_text, candidate_text, review, tool_results, source, task_plan)
+  local APP = M.APP
+  local core = APP.core
+  local parts = {
+    "A completion self-check found that the previous candidate answer did not fully satisfy the user's request.",
+    "Continue the same user request now. Decide whether to call tools or produce a corrected final answer.",
+    "Do not ask the user for confirmation unless the task is genuinely blocked.",
+    "Do not repeat completed tool calls unless the facts are insufficient or contradicted.",
+  }
+  local raw_plan = type(task_plan) == "table" and core.safe_json_encode(task_plan) or nil
+  if raw_plan then
+    parts[#parts + 1] = "Agent task plan: " .. raw_plan
+  end
+  if type(review) == "table" then
+    parts[#parts + 1] = "Self-check reason: " .. core.text_or(review.reason, "")
+    if core.text_or(review.continue_instruction, "") ~= "" then
+      parts[#parts + 1] = "Self-check requested next step: " .. core.text_or(review.continue_instruction, "")
+    end
+  end
+  parts[#parts + 1] = ""
+  parts[#parts + 1] = "Original user request:"
+  parts[#parts + 1] = core.text_or(user_text, "")
+  parts[#parts + 1] = ""
+  parts[#parts + 1] = "Rejected candidate answer:"
+  parts[#parts + 1] = core.utf8_prefix(core.text_or(candidate_text, ""), 1800)
+  parts[#parts + 1] = ""
+  parts[#parts + 1] = "Tool facts already observed:"
+  parts[#parts + 1] = completion_tool_facts(tool_results, 10)
+  local obs = observation_context(12)
+  if obs ~= "" then
+    parts[#parts + 1] = ""
+    parts[#parts + 1] = obs
+  end
+  local lookup_ctx = lookup_context_text(12)
+  if lookup_ctx ~= "" then
+    parts[#parts + 1] = ""
+    parts[#parts + 1] = lookup_ctx
+  end
+  if APP.skills and APP.skills.build_context then
+    local ok, skills_text = pcall(APP.skills.build_context, source)
+    if ok and type(skills_text) == "string" and skills_text ~= "" then
+      parts[#parts + 1] = ""
+      parts[#parts + 1] = skills_text
+    end
+  end
+  append_recent_conversation(parts, 6)
+  return table.concat(parts, "\n")
+end
+
+local function observed_paths_snapshot(max_items)
+  local APP = M.APP
+  local core = APP.core
+  local out = {}
+  local seen = {}
+  max_items = tonumber(max_items) or 40
+  local root = core.trim(APP.APP_DIR)
+  if root:match("^/sd/") then
+    out[#out + 1] = root
+    seen[root] = true
+  end
+  local obs = observations()
+  for i = #obs, 1, -1 do
+    local item = obs[i]
+    if type(item) == "table" and item.kind == "path" then
+      local path = core.trim(item.text)
+      if path:match("^/sd/") and not seen[path] then
+        seen[path] = true
+        table.insert(out, 1, path)
+        if #out >= max_items then
+          break
+        end
+      end
+    end
+  end
+  return out
+end
+
+local function model_choose_inspect_paths(user_text, source, task_plan, tool_results)
+  local APP = M.APP
+  local core = APP.core
+  local paths = observed_paths_snapshot(48)
+  if #paths == 0 then
+    return nil, "no observed paths"
+  end
+  local parts = {
+    "Choose the next files or directories to read for this inspect request.",
+    "Return only JSON: {\"paths\":[\"/sd/...\"],\"reason\":\"short reason\"}.",
+    "Use only paths from Observed paths. Choose 1 to 4 paths that are most relevant to the latest user request.",
+    "Choose files likely to contain the requested facts or records, not merely source code that implements a related feature.",
+    "If a directory was observed and the user needs records/history, you may choose that directory to list it before choosing files.",
+    "Do not invent paths.",
+    "",
+    "Latest user request: " .. core.text_or(user_text, ""),
+    "",
+    "Observed paths:",
+  }
+  for i = 1, #paths do
+    parts[#parts + 1] = "- " .. paths[i]
+  end
+  if type(tool_results) == "table" and #tool_results > 0 then
+    parts[#parts + 1] = ""
+    parts[#parts + 1] = "Recent tool outputs:"
+    for i = 1, math.min(#tool_results, 4) do
+      local item = tool_results[i]
+      if type(item) == "table" then
+        parts[#parts + 1] = "Tool: " .. core.text_or(item.name, "")
+        parts[#parts + 1] = core.utf8_prefix(core.text_or(item.output, ""), 1800)
+      end
+    end
+  end
+  local plan_raw = type(task_plan) == "table" and core.safe_json_encode(task_plan) or ""
+  if plan_raw and plan_raw ~= "" then
+    parts[#parts + 1] = ""
+    parts[#parts + 1] = "Task plan: " .. plan_raw
+  end
+  local choice_source = {}
+  for k, v in pairs(source or {}) do
+    choice_source[k] = v
+  end
+  choice_source.disable_all_tools = true
+  choice_source.router_call = true
+  local resp, err = call_llm(table.concat(parts, "\n"), "", response_instructions(source), choice_source, task_plan)
+  if not resp then
+    return nil, err
+  end
+  local raw_json = extract_json_object(response_text(resp))
+  local parsed = raw_json and core.safe_json_decode(raw_json) or nil
+  if type(parsed) ~= "table" or type(parsed.paths) ~= "table" then
+    return nil, "path choice missing"
+  end
+  local allowed = {}
+  for i = 1, #paths do
+    allowed[paths[i]] = true
+  end
+  local selected = {}
+  local selected_seen = {}
+  for i = 1, math.min(#parsed.paths, 4) do
+    local path = core.trim(parsed.paths[i])
+    if allowed[path] and not selected_seen[path] then
+      selected_seen[path] = true
+      selected[#selected + 1] = path
+    end
+  end
+  if #selected == 0 then
+    return nil, "no selected observed paths"
+  end
+  return selected, core.text_or(parsed.reason, "")
+end
+
+local function inspect_read_code_for_paths(paths)
+  local lines = {
+    "local paths = {",
+  }
+  for i = 1, #(paths or {}) do
+    lines[#lines + 1] = "  " .. string.format("%q", paths[i]) .. ","
+  end
+  lines[#lines + 1] = "}"
+  lines[#lines + 1] = [[
+for _, path in ipairs(paths) do
+  print("----- " .. path .. " -----")
+  local st = file.stat and file.stat(path) or nil
+  if st and st.is_dir then
+    local items = file.listdir(path) or {}
+    for _, e in ipairs(items) do
+      local name = type(e) == "table" and e.name or tostring(e)
+      print(path .. "/" .. name)
+    end
+  else
+    local raw = file.getcontents and file.getcontents(path) or nil
+    if raw and raw ~= "" then
+      local n = #raw
+      print("bytes=" .. tostring(n))
+      if n > 12000 then
+        print("----- tail " .. path .. " -----")
+        print(string.sub(raw, n - 5000))
+        print("----- head " .. path .. " -----")
+        print(string.sub(raw, 1, 2500))
+      else
+        print(raw)
+      end
+    else
+      print("not readable or empty")
+    end
+  end
+end]]
+  return table.concat(lines, "\n")
+end
+
+local function try_model_guided_inspect_read(user_text, source, task_plan, tool_results, turn_id)
+  local APP = M.APP
+  local core = APP.core
+  if type(task_plan) ~= "table" or task_plan.mode ~= "inspect" then
+    return false, nil, nil
+  end
+  local paths, reason = model_choose_inspect_paths(user_text, source, task_plan, tool_results)
+  if not paths or #paths == 0 then
+    return false, nil, reason
+  end
+  local args = {
+    target = "service",
+    code = inspect_read_code_for_paths(paths),
+    timeout_ms = 5000,
+    goal = "model-selected inspect read: " .. core.short_text(reason or "", 120),
+  }
+  local args_json = core.safe_json_encode(args) or "{}"
+  append_ledger({
+    event = "model_guided_tool_step",
+    turn_id = turn_id,
+    tool = "lua_run",
+    selected_paths = paths,
+    reason = reason,
+  })
+  local output = APP.tools.execute_tool("lua_run", args_json)
+  append_ledger({
+    event = "tool_result",
+    turn_id = turn_id,
+    tool = "lua_run",
+    arguments = summarize_tool_args(args_json),
+    output = summarize_tool_output(output),
+  })
+  remember_tool_observations("lua_run", args_json, output)
+  local result = {
+    name = "lua_run",
+    arguments = args_json,
+    output = output,
+  }
+  return true, result, nil
 end
 
 local function normalize_router_bool(value, fallback)
@@ -1660,6 +2705,7 @@ local function apply_task_plan_policy(plan, fallback, user_text)
   local execution_required = normalize_router_bool(plan.execution_required, fallback.execution_required)
   local allow_text_only = normalize_router_bool(plan.allow_text_only, fallback.allow_text_only)
   local has_code_context = normalize_router_bool(plan.has_code_context, fallback.has_code_context)
+  local live_lookup_hint = normalize_router_bool(plan.live_lookup_hint, fallback.live_lookup_hint)
   local confidence = tonumber(plan.confidence) or tonumber(fallback.confidence) or 0.5
   if confidence < 0 then confidence = 0 end
   if confidence > 1 then confidence = 1 end
@@ -1712,6 +2758,7 @@ local function apply_task_plan_policy(plan, fallback, user_text)
     execution_required = execution_required,
     allow_text_only = allow_text_only,
     text_first_request = fallback.text_first_request == true,
+    live_lookup_hint = live_lookup_hint,
     confidence = confidence,
     priority = "latest_user_request",
     router_source = core.text_or(plan.router_source, "model"),
@@ -1735,12 +2782,14 @@ local function model_route_task(user_text, source, fallback)
     return apply_task_plan_policy(fallback, fallback, user_text)
   end
   if fallback.text_first_request == true then
+    -- 用户明确要求先文字讨论时，本地策略优先于模型 router。
     fallback.router_source = "fallback_text_first"
     fallback.router_reason = "text-first policy override"
     return apply_task_plan_policy(fallback, fallback, user_text)
   end
 
   local history = {}
+  -- Router 只看最近几条，避免旧任务把当前短句带偏。
   local start_index = #(APP.history or {}) - 5
   if start_index < 1 then start_index = 1 end
   for i = start_index, #(APP.history or {}) do
@@ -1763,10 +2812,12 @@ local function model_route_task(user_text, source, fallback)
     "Allowed target values: unknown, service, panel.",
     "Use answer/code_review when the user asks to discuss, explain, review, or says text first.",
     "Use inspect when the user wants real local app/source/files under /sd/apps to be read.",
+    "Use debug_previous with needs_history=true for follow-up failure reports such as a prior visual not rendering, not showing, drawing nothing, errors, or asking why the previous result failed.",
     "Use live_lookup when the user needs current external facts such as prices, news, weather, exchange rates, or latest public info.",
+    "Words such as today, latest, weather, or price are hints only; choose live_lookup only when the user is really asking for current external facts.",
     "Use panel only for visible UI/LVGL/Canvas/screen visual work; use service for HTTP, files, source reading, and non-UI Lua.",
     "Set execution_required=true only when the current turn needs a real tool/action, not just an explanation.",
-    "Schema: {\"mode\":\"...\",\"target\":\"...\",\"execution_required\":true,\"allow_text_only\":false,\"needs_history\":false,\"has_code_context\":false,\"confidence\":0.0,\"reason\":\"short\"}",
+    "Schema: {\"mode\":\"...\",\"target\":\"...\",\"execution_required\":true,\"allow_text_only\":false,\"needs_history\":false,\"has_code_context\":false,\"live_lookup_hint\":false,\"confidence\":0.0,\"reason\":\"short\"}",
   }, "\n")
   local input = table.concat({
     "Fallback plan from local heuristics:",
@@ -1801,6 +2852,36 @@ local function model_route_task(user_text, source, fallback)
   return apply_task_plan_policy(parsed, fallback, user_text)
 end
 
+-- 根据任务路由结果预激活必要 Skill，让模型下一步能直接看到操作说明。
+local function ensure_task_skills(task_plan, source)
+  local APP = M.APP
+  if not APP.skills or not APP.skills.activate or type(task_plan) ~= "table" then
+    return
+  end
+  local ids = {}
+  if task_plan.mode == "inspect" then
+    ids[#ids + 1] = "app_inspect"
+  end
+  if task_plan.mode == "live_lookup" then
+    ids[#ids + 1] = "web_search"
+  end
+  if task_plan.mode == "new_code"
+    or task_plan.mode == "modify_previous"
+    or task_plan.mode == "debug_previous"
+    or task_plan.mode == "live_lookup"
+    or task_plan.execution_required == true then
+    ids[#ids + 1] = "code_runner"
+  end
+  local seen = {}
+  for i = 1, #ids do
+    if not seen[ids[i]] then
+      seen[ids[i]] = true
+      pcall(APP.skills.activate, ids[i], source)
+    end
+  end
+end
+
+-- Agent 主入口：准备上下文、调用模型、执行工具循环，最后生成用户可读回复。
 local function run_agent(user_text, source)
   local APP = M.APP
   local core = APP.core
@@ -1819,10 +2900,7 @@ local function run_agent(user_text, source)
     if not final_text then
       return nil, vision_err
     end
-    final_text = core.squash_repeated_reply(final_text)
-    if #final_text > APP.MAX_REPLY_CHARS then
-      final_text = core.short_text(final_text, APP.MAX_REPLY_CHARS)
-    end
+    final_text = fit_final_reply(final_text, source, response_instructions(source), nil)
     APP.history[#APP.history + 1] = { role = "user", content = user_text .. "\n[image] " .. source.image_path }
     APP.history[#APP.history + 1] = { role = "assistant", content = final_text }
     trim_history()
@@ -1832,7 +2910,7 @@ local function run_agent(user_text, source)
     return final_text, nil
   end
 
-  local rounds = tonumber(APP.config.max_tool_rounds) or 4
+  local rounds = core.clamp(tonumber(APP.config.max_tool_rounds) or 32, 1, 64)
   local fallback_plan = classify_task(user_text)
   local task_plan = model_route_task(user_text, source, fallback_plan)
   local plan_expects_implementation = task_plan.execution_required == true
@@ -1847,11 +2925,7 @@ local function run_agent(user_text, source)
   if task_plan.mode == "modify_previous" or task_plan.mode == "debug_previous" then
     context_lookup_limit = 1
   end
-  if task_plan.execution_required == true then
-    if APP.skills and APP.skills.activate then
-      pcall(APP.skills.activate, "code_runner", source)
-    end
-  end
+  ensure_task_skills(task_plan, source)
   local turn_id = tostring(core.now_ms()) .. "-" .. tostring(math.random(1000, 9999))
   append_ledger({
     event = "turn_start",
@@ -1870,11 +2944,17 @@ local function run_agent(user_text, source)
   local max_progress_notices = progress_limit(source)
   local sent_progress_notices = {}
   local saw_lua_run = false
+  local saw_action_run = false
   local saw_lua_error = false
+  local saw_lua_success = false
   local saw_reasoning_only = false
   local saw_activate_skill = false
   local force_final_answer = false
+  local force_lua_run_only = false
+  local guided_inspect_attempted = false
+  local accumulated_tool_results = {}
   local context_lookup_count = 0
+  local completion_reviews = 0
   local function send_progress_once(notice)
     notice = core.trim(notice)
     if notice == "" or sent_progress_notices[notice] then
@@ -1886,6 +2966,7 @@ local function run_agent(user_text, source)
     return true
   end
   local forced_action_retries = 0
+  -- 多轮 function-calling 循环：模型可以先取上下文，再执行动作，再根据结果总结。
   for _ = 1, rounds do
     local llm_source = source
     if force_final_answer then
@@ -1910,12 +2991,35 @@ local function run_agent(user_text, source)
       end
       llm_source.disable_context_tools = true
     end
-    if plan_expects_implementation and ((not saw_lua_run and context_lookup_count >= context_lookup_limit) or saw_lua_error) then
+    if type(task_plan) == "table" and task_plan.target == "service" then
+      if llm_source == source then
+        llm_source = {}
+        for k, v in pairs(source or {}) do
+          llm_source[k] = v
+        end
+      end
+      llm_source.disable_panel_context_tools = true
+    end
+    if force_lua_run_only then
+      if llm_source == source then
+        llm_source = {}
+        for k, v in pairs(source or {}) do
+          llm_source[k] = v
+        end
+      end
+      llm_source.force_lua_run_only = true
+      llm_source.disable_activate_skill = true
+    end
+    if plan_expects_implementation and ((not saw_lua_run and not saw_action_run and context_lookup_count >= context_lookup_limit) or saw_lua_error) then
       llm_source = {}
       for k, v in pairs(source or {}) do
         llm_source[k] = v
       end
       llm_source.disable_context_tools = true
+      if force_lua_run_only then
+        llm_source.force_lua_run_only = true
+        llm_source.disable_activate_skill = true
+      end
       if force_final_answer then
         llm_source.disable_all_tools = true
       elseif saw_activate_skill then
@@ -1936,6 +3040,7 @@ local function run_agent(user_text, source)
       previous_response_id = response_id
     end
 
+    -- 兼容 Responses API 的 function_call 输出；Chat Completions 会在前面归一化。
     local tool_calls = response_function_calls(resp)
     if type(tool_calls) ~= "table" or #tool_calls == 0 then
       local text = response_text(resp)
@@ -1949,23 +3054,76 @@ local function run_agent(user_text, source)
           finish_reason = resp.finish_reason,
         })
       end
-      local implementation_without_run = plan_expects_implementation and not saw_lua_run
-      local repair_without_run = plan_expects_implementation and saw_lua_error
+      local implementation_without_run = plan_expects_implementation and not saw_lua_run and not saw_action_run
+      local repair_without_run = plan_expects_implementation and saw_lua_error and not saw_lua_success
       local needs_action_retry = should_review_no_tool_response(user_text, text, task_plan) or implementation_without_run or repair_without_run
       if force_final_answer and fallback_text ~= "" and response_looks_like_unexecuted_code(text) then
         final_text = fallback_text
         break
       elseif needs_action_retry and forced_action_retries < 2 then
         forced_action_retries = forced_action_retries + 1
+        force_final_answer = false
+        if type(task_plan) == "table" and task_plan.mode == "inspect" then
+          force_lua_run_only = true
+        end
         core.append_log("agent", "review no-tool response")
-        input = force_action_input(user_text, text, task_plan)
+        input = force_action_input(user_text, text, task_plan, source)
         previous_response_id = ""
+      elseif needs_action_retry and type(task_plan) == "table" and task_plan.mode == "inspect"
+        and not guided_inspect_attempted then
+        guided_inspect_attempted = true
+        local ok_guided, guided_result = try_model_guided_inspect_read(user_text, source, task_plan, accumulated_tool_results, turn_id)
+        if ok_guided and type(guided_result) == "table" then
+          accumulated_tool_results[#accumulated_tool_results + 1] = guided_result
+          saw_lua_run = true
+          fallback_text = ""
+          input = tool_summary_input(user_text, { guided_result }, source, task_plan)
+          force_final_answer = true
+          previous_response_id = ""
+        else
+          final_text = "操作未完成：我拿到了候选路径，但还没有读到足够的具体文件内容。"
+          break
+        end
       elseif needs_action_retry and plan_expects_implementation and not saw_lua_run then
         final_text = "操作未完成：这次请求需要实际读取或执行工具，但模型没有调用必要工具。"
         break
       else
-        final_text = text
-        break
+        local continued_by_review = false
+        local candidate_text = text
+        if completion_reviews < 1 then
+          completion_reviews = completion_reviews + 1
+          local review, review_err = completion_self_review(user_text, candidate_text, accumulated_tool_results, source, task_plan)
+          append_ledger({
+            event = "completion_review",
+            turn_id = turn_id,
+            ok = type(review) == "table",
+            complete = type(review) == "table" and review.complete or nil,
+            action = type(review) == "table" and review.action or "",
+            reason = type(review) == "table" and review.reason or core.short_text(review_err, 160),
+          })
+          if type(review) == "table" and review.complete == false then
+            if review.action == "rewrite" and review.revised_answer ~= "" then
+              final_text = review.revised_answer
+              break
+            elseif review.action == "continue" then
+              input = completion_continue_input(user_text, candidate_text, review, accumulated_tool_results, source, task_plan)
+              previous_response_id = ""
+              force_final_answer = false
+              if type(task_plan) == "table" and task_plan.mode == "inspect" then
+                force_lua_run_only = true
+              end
+              core.append_log("agent", "completion review continue")
+              continued_by_review = true
+            elseif review.revised_answer ~= "" then
+              final_text = review.revised_answer
+              break
+            end
+          end
+        end
+        if not continued_by_review then
+          final_text = candidate_text
+          break
+        end
       end
     else
       local tool_names = {}
@@ -1983,6 +3141,7 @@ local function run_agent(user_text, source)
       local tool_results = {}
       local finish_after_tool = false
       local step_context_only = #tool_calls > 0
+      local step_lua_success_with_stdout = false
       for i = 1, #tool_calls do
         local tc = tool_calls[i]
         local name = core.text_or(tc.name, "")
@@ -1996,12 +3155,23 @@ local function run_agent(user_text, source)
             send_progress_once(notice)
           end
         end
+        -- 工具执行结果会进入下一轮模型输入，也会被记录到 execution ledger 便于排查。
         local output = APP.tools.execute_tool(name, args)
         if name == "activate_skill" then
           saw_activate_skill = true
         end
         if name == "lua_run" and not lua_run_needs_followup(user_text, args, output, task_plan) then
           saw_lua_run = true
+        end
+        if name == "web_probe" or name == "web_fetch" or name == "lookup_context" then
+          saw_action_run = true
+        end
+        if name == "lua_run" and lua_run_repairable_error_text(output) == ""
+          and not lua_run_needs_followup(user_text, args, output, task_plan) then
+          local doc = core.safe_json_decode(output)
+          if type(doc) == "table" and doc.ok == true then
+            saw_lua_success = true
+          end
         end
         if name == "lua_run" and lua_run_repairable_error_text(output) ~= "" then
           saw_lua_error = true
@@ -2013,12 +3183,19 @@ local function run_agent(user_text, source)
           arguments = summarize_tool_args(args),
           output = summarize_tool_output(output),
         })
+        remember_tool_observations(name, args, output)
         local reply_hint = APP.tools.tool_success_reply(name, args, output)
         if tool_reply_can_be_fallback(name, args, output, user_text, task_plan) then
           local stdout_reply = name == "lua_run" and lua_stdout_fallback(output, task_plan) or ""
           fallback_text = stdout_reply ~= "" and stdout_reply or reply_hint
         elseif name == "lua_run" and fallback_text == "" then
           fallback_text = lua_stdout_fallback(output, task_plan)
+        end
+        if name == "lua_run"
+          and lua_stdout_fallback(output, task_plan) ~= ""
+          and lua_run_repairable_error_text(output) == ""
+          and not lua_run_needs_followup(user_text, args, output, task_plan) then
+          step_lua_success_with_stdout = true
         end
         if name == "lua_run" and progress_notices < max_progress_notices then
           local notice = code_error_notice(output)
@@ -2055,6 +3232,13 @@ local function run_agent(user_text, source)
           arguments = args,
           output = output,
         }
+        accumulated_tool_results[#accumulated_tool_results + 1] = tool_results[#tool_results]
+        if name == "lua_run" then
+          local trace_reply = tool_results_fallback_text(accumulated_tool_results, task_plan)
+          if trace_reply ~= "" then
+            fallback_text = trace_reply
+          end
+        end
       end
       if finish_after_tool then
         final_text = fallback_text or "操作已执行。"
@@ -2064,9 +3248,13 @@ local function run_agent(user_text, source)
         context_lookup_count = context_lookup_count + 1
       end
       input = tool_followup_input(user_text, tool_results, source, task_plan, context_lookup_count >= context_lookup_limit)
-      if fallback_text ~= "" and not saw_lua_error
+      if fallback_text ~= "" and step_lua_success_with_stdout and not wants_code_explanation(user_text) then
+        input = tool_summary_input(user_text, accumulated_tool_results, source, task_plan)
+        force_final_answer = true
+      elseif fallback_text ~= "" and not saw_lua_error
         and ((type(task_plan) == "table" and task_plan.mode == "live_lookup")
           or user_wants_tool_result_answer(user_text)) then
+        input = tool_summary_input(user_text, accumulated_tool_results, source, task_plan)
         force_final_answer = true
       end
       previous_response_id = ""
@@ -2082,10 +3270,7 @@ local function run_agent(user_text, source)
       final_text = "操作未完成：模型没有给出最终回复。"
     end
   end
-  final_text = core.squash_repeated_reply(final_text)
-  if #final_text > APP.MAX_REPLY_CHARS then
-    final_text = core.short_text(final_text, APP.MAX_REPLY_CHARS)
-  end
+  final_text = fit_final_reply(final_text, source, instructions, task_plan)
 
   APP.history[#APP.history + 1] = { role = "user", content = user_text }
   APP.history[#APP.history + 1] = { role = "assistant", content = final_text }
@@ -2115,6 +3300,7 @@ local function handle_user_message(user_text, source)
 
   local guarded_reply = destructive_delete_guard(user_text)
   if guarded_reply then
+    -- 删除类危险请求在进入 LLM 前拦截，避免模型通过工具绕过去。
     S.busy = false
     S.request_count = S.request_count + 1
     S.last_error = ""
@@ -2131,6 +3317,7 @@ local function handle_user_message(user_text, source)
   end
 
   S.busy = true
+  -- 从这里开始更新共享状态，小屏、WebUI 和微信都会读这些字段。
   S.request_count = S.request_count + 1
   S.last_error = ""
   S.last_user = user_text
@@ -2164,6 +3351,7 @@ function M.init(APP)
     prompt_preview = prompt_preview,
     execution_ledger = execution_ledger,
     classify_task = classify_task,
+    route_task = model_route_task,
   }
 end
 

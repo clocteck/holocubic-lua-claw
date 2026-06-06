@@ -110,7 +110,10 @@ local function tool_activate_skill(args)
     skill_id = result.id,
     description = result.description,
     cap_groups = result.cap_groups,
-    skill_content = result.body,
+    already_active = result.already_active == true,
+    activation_only = true,
+    next_action = "Skill activation only loads instructions. Continue the user request by calling the concrete tools enabled by this skill; do not treat activation as task completion.",
+    skill_content = result.already_active == true and nil or result.body,
   })
   return raw or "{\"ok\":true}"
 end
@@ -228,6 +231,287 @@ local function tool_get_panel_artifacts(args)
   local result = APP.code_runner.panel_artifacts(args)
   local raw = core.safe_json_encode(result)
   return raw or "{\"ok\":true,\"entries\":[]}"
+end
+
+local function ensure_lookup_state()
+  local S = M.APP.state
+  S.lookup_context = type(S.lookup_context) == "table" and S.lookup_context or {}
+  S.lookup_context.sources = type(S.lookup_context.sources) == "table" and S.lookup_context.sources or {}
+  S.lookup_context.items = type(S.lookup_context.items) == "table" and S.lookup_context.items or {}
+  return S.lookup_context
+end
+
+local function source_name_from_url(url)
+  url = M.APP.core.text_or(url, "")
+  local host = url:match("^https?://([^/%?#]+)") or url
+  host = host:gsub("^www%.", "")
+  return host
+end
+
+local function html_entity_decode(text)
+  text = M.APP.core.text_or(text, "")
+  local map = {
+    amp = "&",
+    lt = "<",
+    gt = ">",
+    quot = "\"",
+    apos = "'",
+    nbsp = " ",
+  }
+  text = text:gsub("&(#%d+);", function(num)
+    local n = tonumber(num:sub(2))
+    if n and n >= 32 and n <= 126 then
+      return string.char(n)
+    end
+    return " "
+  end)
+  text = text:gsub("&([%a]+);", function(name)
+    return map[name] or " "
+  end)
+  return text
+end
+
+local function strip_html(text)
+  local core = M.APP.core
+  text = core.text_or(text, "")
+  text = text:gsub("<script[%s%S]->[%s%S]-</script>", " ")
+  text = text:gsub("<style[%s%S]->[%s%S]-</style>", " ")
+  text = text:gsub("<[^>]+>", " ")
+  text = html_entity_decode(text)
+  return core.normalize_space(text)
+end
+
+local function extract_title(body)
+  local core = M.APP.core
+  body = core.text_or(body, "")
+  local title = body:match("<title[^>]*>([%s%S]-)</title>")
+  if title and title ~= "" then
+    return core.short_text(strip_html(title), 160)
+  end
+  title = body:match([["title"%s*:%s*"([^"]+)"]]) or body:match([["name"%s*:%s*"([^"]+)"]])
+  return core.short_text(html_entity_decode(core.text_or(title, "")), 160)
+end
+
+local function add_lookup_item(out, seen, text, url, source)
+  local core = M.APP.core
+  text = strip_html(text)
+  text = text:gsub("^%d+[%.)、%s]+", "")
+  text = core.trim(text)
+  if text == "" or #text < 6 or #text > 220 then
+    return
+  end
+  local lower = text:lower()
+  if lower:find("javascript", 1, true)
+    or lower:find("function", 1, true)
+    or lower:find("var ", 1, true)
+    or lower:find("cookie", 1, true) then
+    return
+  end
+  if seen[text] then
+    return
+  end
+  seen[text] = true
+  out[#out + 1] = {
+    index = #out + 1,
+    title = core.short_text(text, 180),
+    url = core.text_or(url, ""),
+    source = core.text_or(source, ""),
+  }
+end
+
+local function extract_items(body, base_url, source, limit)
+  local core = M.APP.core
+  body = core.text_or(body, "")
+  limit = tonumber(limit) or 20
+  local out = {}
+  local seen = {}
+  for href, text in body:gmatch("<a[^>]-href=[\"']([^\"']+)[\"'][^>]*>([%s%S]-)</a>") do
+    add_lookup_item(out, seen, text, href, source)
+    if #out >= limit then return out end
+  end
+  for text in body:gmatch([["title"%s*:%s*"([^"]+)"]]) do
+    add_lookup_item(out, seen, text, base_url, source)
+    if #out >= limit then return out end
+  end
+  for text in body:gmatch([["name"%s*:%s*"([^"]+)"]]) do
+    add_lookup_item(out, seen, text, base_url, source)
+    if #out >= limit then return out end
+  end
+  for line in strip_html(body):gmatch("[^。！？\n]+[。！？]?") do
+    add_lookup_item(out, seen, line, base_url, source)
+    if #out >= limit then return out end
+  end
+  return out
+end
+
+local function update_lookup_context(ctx)
+  local APP = M.APP
+  local S = ensure_lookup_state()
+  S.at = APP.core.now_ms()
+  S.query = APP.core.text_or(ctx.query, S.query or "")
+  S.kind = APP.core.text_or(ctx.kind, S.kind or "")
+  S.sources = type(ctx.sources) == "table" and ctx.sources or {}
+  S.items = type(ctx.items) == "table" and ctx.items or {}
+  S.summary = APP.core.text_or(ctx.summary, "")
+end
+
+local function fetch_url(url, options)
+  local APP = M.APP
+  local core = APP.core
+  if not http or not http.get then
+    return {
+      ok = false,
+      url = url,
+      status = -1,
+      source = source_name_from_url(url),
+      error = "http.get missing",
+    }
+  end
+  options = type(options) == "table" and options or {}
+  local timeout = core.clamp(options.timeout_ms or 8000, 1000, 20000)
+  local bufsz = core.clamp(options.bufsz or 32768, 4096, 131072)
+  local code, body = http.get(url, {
+    timeout = timeout,
+    bufsz = bufsz,
+    max_redirects = core.clamp(options.max_redirects or 2, 0, 5),
+    headers = {
+      ["User-Agent"] = "ESP-Claw/1.0",
+      ["Accept"] = "text/html,application/json,text/plain,*/*",
+    },
+  })
+  body = core.text_or(body, "")
+  local status = tonumber(code) or -1
+  local ok = status >= 200 and status < 400 and body ~= ""
+  local title = ok and extract_title(body) or ""
+  local excerpt = ok and core.short_text(strip_html(body), options.excerpt_chars or 1200) or ""
+  local source = source_name_from_url(url)
+  return {
+    ok = ok,
+    url = url,
+    status = status,
+    source = source,
+    title = title,
+    excerpt = excerpt,
+    bytes = #body,
+    error = ok and "" or core.short_text(body, 300),
+    body = body,
+  }
+end
+
+local function tool_web_probe(args)
+  local APP = M.APP
+  local core = APP.core
+  args = type(args) == "table" and args or {}
+  local urls = type(args.urls) == "table" and args.urls or {}
+  local query = core.text_or(args.query, "")
+  local kind = core.text_or(args.kind, "general")
+  local limit = core.clamp(args.limit or #urls, 1, 5)
+  local results = {}
+  local sources = {}
+  for i = 1, math.min(#urls, limit) do
+    local url = core.trim(urls[i])
+    if url ~= "" then
+      local r = fetch_url(url, {
+        timeout_ms = args.timeout_ms or 7000,
+        bufsz = 16384,
+        excerpt_chars = 360,
+      })
+      r.body = nil
+      results[#results + 1] = r
+      sources[#sources + 1] = {
+        url = r.url,
+        source = r.source,
+        status = r.status,
+        ok = r.ok,
+        title = r.title,
+        error = r.error,
+      }
+    end
+  end
+  update_lookup_context({
+    query = query,
+    kind = kind,
+    sources = sources,
+    items = {},
+    summary = "web_probe checked " .. tostring(#results) .. " source(s)",
+  })
+  local raw = core.safe_json_encode({
+    ok = true,
+    query = query,
+    kind = kind,
+    results = results,
+    guidance = "A single failed URL does not prove the device is offline. Compare the statuses and continue with reachable sources.",
+  })
+  return raw or "{\"ok\":true}"
+end
+
+local function tool_web_fetch(args)
+  local APP = M.APP
+  local core = APP.core
+  args = type(args) == "table" and args or {}
+  local url = core.trim(args.url)
+  if url == "" then
+    return "{\"ok\":false,\"error\":\"url is required\"}"
+  end
+  local query = core.text_or(args.query, "")
+  local kind = core.text_or(args.kind, "general")
+  local r = fetch_url(url, {
+    timeout_ms = args.timeout_ms or 9000,
+    bufsz = args.bufsz or 65536,
+    excerpt_chars = args.excerpt_chars or 1600,
+  })
+  local items = {}
+  if r.ok then
+    items = extract_items(r.body, url, r.source, core.clamp(args.item_limit or 16, 0, 30))
+  end
+  r.body = nil
+  r.items = items
+  update_lookup_context({
+    query = query,
+    kind = kind,
+    sources = {
+      {
+        url = r.url,
+        source = r.source,
+        status = r.status,
+        ok = r.ok,
+        title = r.title,
+        error = r.error,
+      },
+    },
+    items = items,
+    summary = r.ok and ("web_fetch " .. r.source .. " ok") or ("web_fetch " .. r.source .. " failed"),
+  })
+  local raw = core.safe_json_encode({
+    ok = r.ok,
+    url = r.url,
+    status = r.status,
+    source = r.source,
+    title = r.title,
+    excerpt = r.excerpt,
+    bytes = r.bytes,
+    error = r.error,
+    items = items,
+    guidance = "Answer from title/excerpt/items and cite the concise source name. Do not claim more than this page supports.",
+  })
+  return raw or "{\"ok\":false,\"error\":\"web_fetch encode failed\"}"
+end
+
+local function tool_lookup_context(args)
+  local APP = M.APP
+  local core = APP.core
+  local S = ensure_lookup_state()
+  local raw = core.safe_json_encode({
+    ok = true,
+    at = S.at or 0,
+    query = core.text_or(S.query, ""),
+    kind = core.text_or(S.kind, ""),
+    sources = S.sources,
+    items = S.items,
+    summary = core.text_or(S.summary, ""),
+    guidance = "Use this for follow-up questions such as item numbers, source questions, or details from the previous live lookup.",
+  })
+  return raw or "{\"ok\":true}"
 end
 
 local TOOL_DEFS = {
@@ -355,6 +639,62 @@ local TOOL_DEFS = {
           query = { type = "string", description = "Memory text or keyword to forget." },
         },
         required = { "query" },
+      },
+    },
+  },
+  {
+    groups = { "code_runner" },
+    type = "function",
+    ["function"] = {
+      name = "web_probe",
+      description = "Probe 1-5 public URLs for live lookup and return structured reachability status. Use before declaring that network or realtime lookup is unavailable.",
+      parameters = {
+        type = "object",
+        properties = {
+          query = { type = "string", description = "The user's lookup question or search topic." },
+          kind = { type = "string", description = "Optional lookup kind: news, docs, price, weather, official, or general." },
+          urls = {
+            type = "array",
+            description = "Candidate public URLs to probe. Prefer official pages for professional/model/API questions.",
+            items = { type = "string" },
+          },
+          limit = { type = "integer", minimum = 1, maximum = 5 },
+          timeout_ms = { type = "integer", minimum = 1000, maximum = 20000 },
+        },
+        required = { "urls" },
+      },
+    },
+  },
+  {
+    groups = { "code_runner" },
+    type = "function",
+    ["function"] = {
+      name = "web_fetch",
+      description = "Fetch one public page and return {url,status,source,title,excerpt,items} without dumping large HTML. Also saves lookup_context for follow-up questions.",
+      parameters = {
+        type = "object",
+        properties = {
+          url = { type = "string", description = "Public URL to fetch." },
+          query = { type = "string", description = "The user's lookup question or search topic." },
+          kind = { type = "string", description = "Optional lookup kind: news, docs, price, weather, official, or general." },
+          item_limit = { type = "integer", minimum = 0, maximum = 30 },
+          excerpt_chars = { type = "integer", minimum = 200, maximum = 3000 },
+          timeout_ms = { type = "integer", minimum = 1000, maximum = 20000 },
+          bufsz = { type = "integer", minimum = 4096, maximum = 131072 },
+        },
+        required = { "url" },
+      },
+    },
+  },
+  {
+    groups = { "code_runner" },
+    type = "function",
+    ["function"] = {
+      name = "lookup_context",
+      description = "Return the most recent live lookup sources and extracted items for follow-up questions such as item numbers or source provenance.",
+      parameters = {
+        type = "object",
+        properties = {},
       },
     },
   },
@@ -543,10 +883,18 @@ local HOSTED_TOOL_DEFS = {
 local function tool_is_visible(item, source)
   local fn = type(item) == "table" and item["function"] or nil
   local name = type(fn) == "table" and fn.name or ""
+  -- source 里的开关由 Agent 循环临时设置，用来限制某一轮可见工具。
   if type(source) == "table" and source.disable_all_tools then
     return false
   end
   if type(source) == "table" and source.disable_activate_skill and name == "activate_skill" then
+    return false
+  end
+  if type(source) == "table" and source.force_lua_run_only and name ~= "lua_run" then
+    return false
+  end
+  if type(source) == "table" and source.disable_panel_context_tools
+    and (name == "get_panel_history" or name == "get_panel_artifacts") then
     return false
   end
   if type(source) == "table" and source.disable_context_tools
@@ -558,6 +906,7 @@ local function tool_is_visible(item, source)
   if type(groups) ~= "table" or #groups == 0 then
     return true
   end
+  -- 带 groups 的工具必须先激活对应 Skill，避免模型越过用户可见能力边界。
   local APP = M.APP
   if not APP.skills or not APP.skills.is_group_active then
     return false
@@ -570,7 +919,139 @@ local function tool_is_visible(item, source)
   return false
 end
 
--- 返回 Responses API 使用的扁平 tool 定义，按当前会话已激活 Skill 过滤。
+-- 下面这些辅助函数把工具能力组反查到 Skill，用于生成更清楚的模型提示。
+local function tool_groups(item)
+  local groups = type(item) == "table" and item.groups or nil
+  return type(groups) == "table" and groups or {}
+end
+
+local function group_tool_names()
+  local out = {}
+  for i = 1, #TOOL_DEFS do
+    local item = TOOL_DEFS[i]
+    local fn = type(item) == "table" and item["function"] or nil
+    local name = type(fn) == "table" and fn.name or ""
+    if name ~= "" then
+      local groups = tool_groups(item)
+      for j = 1, #groups do
+        local group = M.APP.core.trim(groups[j])
+        if group ~= "" then
+          out[group] = out[group] or {}
+          out[group][#out[group] + 1] = name
+        end
+      end
+    end
+  end
+  return out
+end
+
+local function skills_for_groups(groups)
+  local APP = M.APP
+  local out = {}
+  local seen = {}
+  if not APP.skills or not APP.skills.snapshot then
+    return out
+  end
+  local ok, snap = pcall(APP.skills.snapshot, {
+    channel = APP.state.last_channel,
+    chat_id = APP.state.last_chat_id,
+  })
+  local catalog = ok and type(snap) == "table" and type(snap.catalog) == "table" and snap.catalog or {}
+  for i = 1, #catalog do
+    local skill = catalog[i]
+    local skill_groups = type(skill) == "table" and type(skill.cap_groups) == "table" and skill.cap_groups or {}
+    for j = 1, #skill_groups do
+      for k = 1, #groups do
+        if skill_groups[j] == groups[k] then
+          local id = APP.core.text_or(skill.id, "")
+          if id ~= "" and not seen[id] then
+            seen[id] = true
+            out[#out + 1] = id
+          end
+        end
+      end
+    end
+  end
+  table.sort(out)
+  return out
+end
+
+local function tool_requirement_text(item)
+  local groups = tool_groups(item)
+  if #groups == 0 then
+    return ""
+  end
+  local skills = skills_for_groups(groups)
+  if #skills == 1 then
+    return "Requires active skill: " .. table.concat(skills, ", ") .. "."
+  elseif #skills > 1 then
+    return "Requires one active skill: " .. table.concat(skills, " or ") .. "."
+  end
+  return "Requires active capability group: " .. table.concat(groups, ", ") .. "."
+end
+
+local function function_def_for_model(item)
+  local fn = type(item) == "table" and item["function"] or nil
+  if type(fn) ~= "table" then
+    return nil
+  end
+  local description = M.APP.core.text_or(fn.description, "")
+  local req = tool_requirement_text(item)
+  if req ~= "" and description:find(req, 1, true) == nil then
+    description = description ~= "" and (description .. " " .. req) or req
+  end
+  return {
+    name = fn.name,
+    description = description,
+    parameters = fn.parameters,
+  }
+end
+
+-- 生成 Skill 到工具的可见映射，帮助模型先激活 Skill 再调用具体工具。
+local function skill_tool_context(source)
+  local APP = M.APP
+  if not APP.skills or not APP.skills.snapshot then
+    return ""
+  end
+  local ok, snap = pcall(APP.skills.snapshot, source)
+  if not ok or type(snap) ~= "table" or type(snap.catalog) ~= "table" then
+    return ""
+  end
+  local group_tools = group_tool_names()
+  local active = {}
+  if type(snap.active) == "table" then
+    for i = 1, #snap.active do
+      active[APP.core.text_or(snap.active[i], "")] = true
+    end
+  end
+  local lines = {
+    "Skill-Tool Map:",
+    "Activate the listed skill before calling its tools. If a skill is already active, call its tools directly and do not activate it again.",
+  }
+  for i = 1, #snap.catalog do
+    local skill = snap.catalog[i]
+    local id = APP.core.text_or(type(skill) == "table" and skill.id or "", "")
+    local groups = type(skill) == "table" and type(skill.cap_groups) == "table" and skill.cap_groups or {}
+    local tools = {}
+    local seen = {}
+    for j = 1, #groups do
+      local names = group_tools[groups[j]] or {}
+      for k = 1, #names do
+        if not seen[names[k]] then
+          seen[names[k]] = true
+          tools[#tools + 1] = names[k]
+        end
+      end
+    end
+    table.sort(tools)
+    if id ~= "" and #tools > 0 then
+      lines[#lines + 1] = "- " .. id .. (active[id] and " (active)" or "") .. " enables tools: " .. table.concat(tools, ", ")
+    end
+  end
+  return #lines > 2 and table.concat(lines, "\n") or ""
+end
+
+-- Responses API 使用扁平 function schema。
 local function response_tool_defs(source)
   local out = {}
   if not (type(source) == "table" and source.disable_all_tools) then
@@ -579,7 +1060,7 @@ local function response_tool_defs(source)
     end
   end
   for i = 1, #TOOL_DEFS do
-    local fn = TOOL_DEFS[i]["function"]
+    local fn = function_def_for_model(TOOL_DEFS[i])
     if type(fn) == "table" and tool_is_visible(TOOL_DEFS[i], source) then
       out[#out + 1] = {
         type = "function",
@@ -592,10 +1073,11 @@ local function response_tool_defs(source)
   return out
 end
 
+-- Chat Completions 使用 function 包裹 schema。
 local function chat_tool_defs(source)
   local out = {}
   for i = 1, #TOOL_DEFS do
-    local fn = TOOL_DEFS[i]["function"]
+    local fn = function_def_for_model(TOOL_DEFS[i])
     if type(fn) == "table" and tool_is_visible(TOOL_DEFS[i], source) then
       out[#out + 1] = {
         type = "function",
@@ -606,7 +1088,7 @@ local function chat_tool_defs(source)
   return out
 end
 
--- 执行 LLM 请求的工具调用。
+-- 执行 LLM 请求的工具调用；所有工具入参都先从 JSON 收口成 Lua table。
 local function execute_tool(name, args_json)
   local APP = M.APP
   local core = APP.core
@@ -696,6 +1178,15 @@ local function execute_tool(name, args_json)
   end
   if name == "get_panel_artifacts" then
     return tool_get_panel_artifacts(args)
+  end
+  if name == "web_probe" then
+    return tool_web_probe(args)
+  end
+  if name == "web_fetch" then
+    return tool_web_fetch(args)
+  end
+  if name == "lookup_context" then
+    return tool_lookup_context(args)
   end
   if name == "lua_run" and APP.code_runner and APP.code_runner.run then
     local ok, result = APP.code_runner.run(args)
@@ -839,6 +1330,32 @@ local function tool_success_reply(name, args_json, output)
     end
     return "已读取最近 Panel 记录：" .. core.short_text(entries[1].title or entries[1].id or "", 80)
   end
+  if name == "web_probe" then
+    local doc = core.safe_json_decode(output)
+    local results = type(doc) == "table" and type(doc.results) == "table" and doc.results or {}
+    local ok_count = 0
+    for i = 1, #results do
+      if type(results[i]) == "table" and results[i].ok then
+        ok_count = ok_count + 1
+      end
+    end
+    return "已检查 " .. tostring(#results) .. " 个来源，其中 " .. tostring(ok_count) .. " 个可访问。"
+  end
+  if name == "web_fetch" then
+    local doc = core.safe_json_decode(output)
+    if type(doc) == "table" and doc.ok then
+      return "已读取来源 " .. core.text_or(doc.source, "") .. "：" .. core.short_text(doc.title or doc.excerpt or "", 120)
+    end
+    local source = type(doc) == "table" and core.text_or(doc.source, "") or ""
+    local err = type(doc) == "table" and core.text_or(doc.error, "") or output
+    return "读取来源失败" .. (source ~= "" and ("（" .. source .. "）") or "") .. "：" .. core.short_text(err, 120)
+  end
+  if name == "lookup_context" then
+    local doc = core.safe_json_decode(output)
+    local items = type(doc) == "table" and type(doc.items) == "table" and doc.items or {}
+    local sources = type(doc) == "table" and type(doc.sources) == "table" and doc.sources or {}
+    return "已读取上次查询上下文：来源 " .. tostring(#sources) .. " 个，条目 " .. tostring(#items) .. " 条。"
+  end
   if name == "lua_run" then
     local doc = core.safe_json_decode(output)
     if type(doc) == "table" and doc.ok then
@@ -891,6 +1408,7 @@ function M.init(APP)
   APP.tools = {
     response_tool_defs = response_tool_defs,
     chat_tool_defs = chat_tool_defs,
+    skill_tool_context = skill_tool_context,
     execute_tool = execute_tool,
     tool_success_reply = tool_success_reply,
     should_finish_after_tool = should_finish_after_tool,

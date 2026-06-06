@@ -5,7 +5,10 @@
     "rule": "LVGL/UI code runs on Claw Panel; non-UI Lua runs in ESP Claw service.",
     "panel_markers": ["lv_", "LV_", "lvgl", "LVGL", "ui_scr_act", "ui_clear"]
   },
-  "lua_modules": ["tmr", "file", "wifi", "net", "httpd", "http", "uart", "i2s", "websocket", "json", "sjson", "app", "sys"],
+  "lua_modules": ["tmr", "file", "wifi", "net", "httpd", "http", "uart", "i2s", "websocket", "app", "sys"],
+  "serialization": {
+    "json": "Do not use require(\"json\") or require(\"sjson\") in lua_run code; those modules are not loadable by require in this environment. For small JSON output, build the string with string.format/table.concat."
+  },
   "timer": {
     "preferred": "local timer = add_timer(tmr.create()); timer:alarm(ms, tmr.ALARM_AUTO, cb)",
     "constants": ["tmr.ALARM_SINGLE", "tmr.ALARM_AUTO", "tmr.ALARM_SEMI"],

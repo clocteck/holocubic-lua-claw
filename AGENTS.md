@@ -37,3 +37,6 @@ $base = "http://192.168.31.200"
 Invoke-RestMethod "$base/devtools/api/list?path=/sd/apps/esp_claw"
 Invoke-RestMethod "$base/devtools/api/code/run" -Method Post -ContentType "text/plain; charset=utf-8" -Body 'app.rescan(); print(app.start_service("esp_claw"))'
 ```
+## 目标
+  - 是让模型变聪明、长对话自然，核心不应该是堆硬编码和硬规则
+  - 可以把很多东西交给模型判断,把模型放在信息更完整、动作边界更清楚的位置上

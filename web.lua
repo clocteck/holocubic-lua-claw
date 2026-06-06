@@ -79,6 +79,7 @@ local function schedule_chat_job(APP)
   local timer = tmr.create()
   APP.chat_job_timer = timer
   APP.add_timer(timer)
+  -- Web 请求先返回 202，真正的 LLM 对话放到单次 timer 里执行，避免 HTTP handler 长时间占住。
   timer:alarm(600, tmr.ALARM_SINGLE or 0, function()
     pcall(function() timer:stop() end)
     pcall(function() timer:unregister() end)
@@ -135,6 +136,7 @@ local function route_chat(req)
     return core.error_response("400 Bad Request", "message is required")
   end
   local active = ensure_chat_job(APP)
+  -- 设备端一次只跑一个聊天 job，避免多个 LLM/tool 循环同时写状态和文件。
   if APP.state.busy or chat_job_active(active) then
     return core.json_response("202 Accepted", {
       ok = true,
@@ -145,6 +147,7 @@ local function route_chat(req)
     })
   end
   if doc.reset then
+    -- reset 只清当前 Web 会话上下文，不清长期记忆。
     APP.history = {}
     if APP.skills and APP.skills.clear_session then
       APP.skills.clear_session({ channel = "web", chat_id = "web" })
@@ -236,6 +239,7 @@ local function route_api(req)
   end
 
   local action = core.trim(doc.action)
+  -- WebUI 所有轻量动作都走同一个 action API，聊天本身走 /chat job 流程。
   local source = {
     channel = core.text_or(doc.channel, "web"),
     chat_id = core.text_or(doc.chat_id, "web"),
@@ -320,9 +324,19 @@ local function route_api(req)
     if not APP.agent or not APP.agent.classify_task then
       return core.error_response("500 Internal Server Error", "classifier missing")
     end
+    local message = core.text_or(doc.message or doc.text, "")
+    local fallback = APP.agent.classify_task(message)
+    local plan = fallback
+    if doc.semantic == true or doc.use_llm == true then
+      if not APP.agent.route_task then
+        return core.error_response("500 Internal Server Error", "semantic router missing")
+      end
+      plan = APP.agent.route_task(message, source, fallback)
+    end
     return core.json_response("200 OK", {
       ok = true,
-      plan = APP.agent.classify_task(core.text_or(doc.message or doc.text, "")),
+      plan = plan,
+      fallback_plan = fallback,
     })
   end
   if action == "code_capabilities" then
@@ -559,6 +573,7 @@ local function start()
     max_handlers = 64,
   })
   register_route_set(APP.ROUTE_BASE)
+  -- app.route_base 可能变化，保留 /esp_claw 作为固定兼容入口。
   if APP.ROUTE_BASE ~= "/esp_claw" then
     register_route_set("/esp_claw")
   end

@@ -354,6 +354,7 @@ local function save_facts()
   trim_facts()
 
   local lines = {}
+  -- JSONL 的好处是单条坏记录不会拖垮整份长期记忆。
   for i = 1, #M.facts do
     local raw = core.safe_json_encode(M.facts[i])
     if raw then
@@ -469,6 +470,7 @@ local function add_fact(text, opts)
   local scope = core.text_or(opts.scope, "chat")
   local chat_id = core.text_or(opts.chat_id, "")
   local kind = core.text_or(opts.kind, "fact")
+  -- 同一 scope/chat 下的近似重复事实只增强权重，不重复写入。
   for i = 1, #M.facts do
     local item = M.facts[i]
     if fact_key(fact_content(item)) == key
@@ -596,6 +598,7 @@ local function recall(user_text, source)
   end
   load_facts()
 
+  -- 不引入向量库，按关键词、scope 和分数做轻量召回，适合嵌入式端。
   local ranked = {}
   for i = 1, #M.facts do
     local item = M.facts[i]
@@ -793,6 +796,7 @@ local function build_context(user_text, source)
     return ""
   end
 
+  -- 只把少量相关记忆注入 prompt，避免长期记录压过最新用户请求。
   local parts = {}
   ensure_dirs()
 
@@ -897,6 +901,7 @@ local function observe_turn(user_text, reply, source)
   end
   source = type(source) == "table" and source or {}
 
+  -- 每轮结束后只做低成本观察：显式记忆指令、忘记指令和短会话摘要。
   local forget = extract_forget_text(user_text)
   if forget ~= "" then
     forget_matching(forget, source)

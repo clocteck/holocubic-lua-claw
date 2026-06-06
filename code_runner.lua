@@ -212,7 +212,10 @@ local function default_capabilities()
       panel_markers = { "lv_", "LV_", "lvgl", "LVGL", "ui_scr_act", "ui_clear" },
       rule = "LVGL/UI code runs on Claw Panel; non-UI Lua runs in ESP Claw service.",
     },
-    lua_modules = { "tmr", "file", "wifi", "net", "httpd", "http", "uart", "i2s", "websocket", "json", "sjson", "app", "sys" },
+    lua_modules = { "tmr", "file", "wifi", "net", "httpd", "http", "uart", "i2s", "websocket", "app", "sys" },
+    serialization = {
+      json = "Do not use require(\"json\") or require(\"sjson\") in lua_run code; those modules are not loadable by require in this environment. For small JSON output, build the string with string.format/table.concat.",
+    },
     timer = {
       preferred = "local timer = add_timer(tmr.create()); timer:alarm(ms, tmr.ALARM_AUTO, cb)",
       constants = { "tmr.ALARM_SINGLE", "tmr.ALARM_AUTO", "tmr.ALARM_SEMI" },
@@ -256,6 +259,7 @@ local function code_uses_unknown_lua_module(code, name)
     or code:find("require%s*['\"]" .. name .. "['\"]", 1, false) ~= nil
 end
 
+-- 运行前做轻量静态预检：把常见设备 API 误用挡在真正执行之前。
 local function preflight(args)
   local APP = M.APP
   local core = APP.core
@@ -298,6 +302,9 @@ local function preflight(args)
     if code:find("lv_color_hex", 1, true) then
       add_issue(errors, "error", "unknown_color_api", "lv_color_hex is unavailable; use 0xRRGGBB")
     end
+    if code:find("lv_align_", 1, true) or code:find("LV_ALIGN_", 1, true) then
+      add_issue(errors, "error", "unknown_lvgl_constant", "lv_align_* constants are unavailable; use lv_obj_center() or integer lv_obj_set_pos()/lv_obj_align() arguments only after probing")
+    end
     if code:find("lv_obj_set_[%w_]+%([^%)]*%d+%.%d+", 1, false) then
       add_issue(errors, "error", "float_pixel_literal", "LVGL object position/size calls must use integer pixels")
     end
@@ -321,6 +328,9 @@ local function preflight(args)
   end
   if code_uses_unknown_lua_module(code, "os") then
     add_issue(errors, "error", "module_unavailable", "os module is not available in Panel")
+  end
+  if code_uses_unknown_lua_module(code, "json") or code_uses_unknown_lua_module(code, "sjson") then
+    add_issue(errors, "error", "module_unavailable", "json/sjson modules are not loadable with require() in lua_run; build simple JSON strings manually or use already-probed globals only")
   end
 
   return {
@@ -669,6 +679,7 @@ local function write_atomic(path, raw)
   local APP = M.APP
   local core = APP.core
   local tmp = path .. ".tmp"
+  -- 先写临时文件再 rename，避免 Panel 读到半截 JSON 命令。
   local ok_write, write_err = core.write_text_file(tmp, raw)
   if not ok_write then
     return false, write_err
@@ -712,6 +723,7 @@ end
 local function ensure_panel_mailbox()
   local APP = M.APP
   local core = APP.core
+  -- Panel runtime 缺失时由 service 自动安装，用户只需要运行 esp_claw 服务。
   local ok_apps, apps_err = core.ensure_dir("/sd/apps")
   if not ok_apps then
     return false, apps_err
@@ -737,6 +749,7 @@ end
 
 function code_looks_visual(code)
   code = M.APP.core.text_or(code, "")
+  -- 只用少量稳定标记判断可视化任务，避免把普通文件/HTTP Lua 误投到 Panel。
   return code:find("lv_", 1, true)
     or code:find("LV_", 1, true)
     or code:find("lvgl", 1, true)
@@ -932,6 +945,7 @@ local function run_on_panel(args, code, timeout_ms)
   return false, panel_timeout_response(seq, code, checksum, cmd_file, fresh, status)
 end
 
+-- Service 侧执行非可视化 Lua。这里给代码一个独立 env，同时保留必要的全局设备 API。
 local function run_local(args, code, timeout_ms)
   local APP = M.APP
   local core = APP.core
@@ -972,6 +986,7 @@ local function run_local(args, code, timeout_ms)
 end
 
 -- 执行模型生成的 Lua 片段。service 里执行逻辑代码；LVGL 代码自动转交 Claw Panel。
+-- lua_run 总入口：先预检，再按代码内容自动选择 service 或 panel。
 local function run(args)
   local APP = M.APP
   local core = APP.core
@@ -986,6 +1001,7 @@ local function run(args)
 
   local check = preflight({ code = code })
   if not check.ok then
+    -- 预检失败直接返回给模型修正，不进入真实执行阶段。
     return false, add_code_trace({
       ok = false,
       target = check.target,
@@ -1002,6 +1018,7 @@ local function run(args)
   else
     ok, response = run_local(args, code, timeout_ms)
   end
+  -- Panel 历史只记录可视化运行，方便 WebUI 重跑和后续“继续修改”。
   if type(response) == "table" and type(check.warnings) == "table" and #check.warnings > 0 then
     response.preflight = {
       ok = check.ok,
@@ -1024,6 +1041,7 @@ local function run(args)
     and failure_text:find("panel result timeout", 1, true) == nil
     and failure_text:find("launch panel failed", 1, true) == nil
     and failure_text:find("app.launch missing", 1, true) == nil
+  -- 记录真正代码错误的 checksum，防止模型原样重复运行同一段失败代码。
   if ok then
     S.failed_checksums[checksum] = nil
   elseif code_failure then

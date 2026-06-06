@@ -323,6 +323,7 @@ local function safe_json_encode(value)
   if not json or not json.encode then
     return nil, "json missing"
   end
+  -- 设备侧字符串来源复杂，编码前先递归清理 UTF-8，减少上游 HTTP/JSON 报错。
   local ok, raw, err = pcall(function()
     local text, encode_err = json.encode(sanitize_json_value(value))
     return text, encode_err
@@ -441,8 +442,10 @@ local function apply_config(cfg)
       APP.config.llm_reasoning_effort = "high"
     end
   end
-  APP.config.max_tool_rounds = clamp(cfg.max_tool_rounds or APP.config.max_tool_rounds, 1, 8)
+  APP.config.max_tool_rounds = clamp(cfg.max_tool_rounds or APP.config.max_tool_rounds, 1, 64)
   APP.config.history_limit = clamp(cfg.history_limit or APP.config.history_limit, 0, 30)
+  APP.config.history_token_limit = clamp(cfg.history_token_limit or APP.config.history_token_limit, 1000, 60000)
+  APP.config.history_message_char_limit = clamp(cfg.history_message_char_limit or APP.config.history_message_char_limit, 400, 12000)
   if type(cfg.progress_level) == "string" then
     local level = trim(cfg.progress_level)
     if level == "off" or level == "normal" or level == "verbose" then
@@ -507,6 +510,8 @@ local function public_config()
     llm_reasoning_effort = APP.config.llm_reasoning_effort,
     max_tool_rounds = APP.config.max_tool_rounds,
     history_limit = APP.config.history_limit,
+    history_token_limit = APP.config.history_token_limit,
+    history_message_char_limit = APP.config.history_message_char_limit,
     progress_level = APP.config.progress_level,
     memory_enabled = APP.config.memory_enabled,
     memory_fact_limit = APP.config.memory_fact_limit,
@@ -668,6 +673,7 @@ end
 local function save_config(partial)
   local APP = M.APP
   local merged = {}
+  -- WebUI 保存的是局部表；先复制现有配置，避免没提交的字段被清空。
   for k, v in pairs(APP.config) do
     merged[k] = v
   end
@@ -702,6 +708,7 @@ local function refresh_panel_status_cache()
   local S = APP.state
   local id = trim(APP.config and APP.config.panel_app_id or "")
   if id == "" then id = "claw_panel" end
+  -- Panel 是另一个前台 app，通过 status.json 心跳和 service 交换最小状态。
   local raw = read_text_file("/sd/apps/" .. id .. "/status.json")
   if type(raw) ~= "string" or raw == "" then
     return
@@ -730,6 +737,7 @@ end
 local function status_snapshot()
   local APP = M.APP
   local S = APP.state
+  -- 快照会被 WebUI 高频轮询，内容保持轻量且自动脱敏。
   refresh_panel_status_cache()
   local remain, used, total = nil, nil, nil
   if file and file.fsinfo then

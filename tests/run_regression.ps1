@@ -107,6 +107,25 @@ function Test-ClassifyTextFirst {
   }
 }
 
+function Test-ClassifySemantic {
+  param(
+    [string]$Name,
+    [string]$Message,
+    [string]$Mode,
+    [bool]$NeedsHistory,
+    [string]$Target
+  )
+  try {
+    $doc = @{ action = "classify_task"; message = $Message; semantic = $true }
+    $r = Invoke-Claw -Doc $doc -TimeoutSec 45
+    $p = $r.plan
+    $ok = $r.ok -and $p.mode -eq $Mode -and $p.needs_history -eq $NeedsHistory -and $p.target -eq $Target
+    Add-Result $Name $ok ("mode={0} needs_history={1} target={2} source={3}" -f $p.mode, $p.needs_history, $p.target, $p.router_source)
+  } catch {
+    Add-Result $Name $false $_.Exception.Message
+  }
+}
+
 function Latest-Turn {
   param([string]$GoalPrefix)
   $doc = @{ action = "execution_ledger"; limit = 120 }
@@ -120,6 +139,42 @@ function Latest-Turn {
   if (-not $turn) { return $null }
   $events = @($ledger.entries | Where-Object { $_.turn_id -eq $turn.turn_id })
   [pscustomobject]@{ start = $turn; events = $events }
+}
+
+function Turn-Tools {
+  param($Turn)
+  $tools = @()
+  if (-not $Turn) { return $tools }
+  foreach ($e in @($Turn.events)) {
+    if ($e.tool) { $tools += [string]$e.tool }
+    if ($e.tools) {
+      foreach ($t in @($e.tools)) { $tools += [string]$t }
+    }
+  }
+  $tools
+}
+
+function Turn-LuaOutputs {
+  param($Turn)
+  $outs = @()
+  if (-not $Turn) { return $outs }
+  foreach ($e in @($Turn.events)) {
+    if ($e.event -eq "tool_result" -and $e.tool -eq "lua_run" -and $e.output) {
+      $outs += $e.output
+    }
+  }
+  $outs
+}
+
+function Turn-LuaStdoutText {
+  param($Turn)
+  $parts = @()
+  foreach ($o in @(Turn-LuaOutputs $Turn)) {
+    if ($o.stdout) { $parts += [string]$o.stdout }
+    if ($o.result) { $parts += [string]$o.result }
+    if ($o.error) { $parts += [string]$o.error }
+  }
+  ($parts -join "`n")
 }
 
 function Wait-ClawReady {
@@ -209,13 +264,16 @@ Test-Classify "classify modify current artifact" (U8 "5Zyo5b2T5YmN5Y2V5pGG6JOd6I
 Test-Classify "classify debug previous visual" (U8 "5pGG5p2G57q/5p2h5rKh55S75Ye65p2l") "debug_previous" $true "panel"
 Test-Classify "classify service lua run" (U8 "6L+Q6KGM5LiA5q61IEx1YSDmiZPljbAgaGVsbG/vvIzlj6rpnIDopoHmiafooYw=") "new_code" $false "service"
 Test-ClassifyTextFirst "classify text-first code mention" (U8 "5L2g6IO96K6/6Zeu5LqS6IGU572R5ZCXP+iDvee7meiHquW3seWinuWKoOiuv+mXruS6kuiBlOe9keeahHNraWxs5ZCXPyjpgJrov4fnm7TmjqXkv67mlLnoh6rlt7HnmoTku6PnoIEpIOWFiOaWh+Wtl+WbnuWkjQ==")
-Test-Classify "classify live price lookup" (U8 "5p+l6K+i5LuK5aSp6buE6YeR55m96ZO25Lu35qC8") "live_lookup" $false "service"
+Test-Classify "classify live price weak fallback" (U8 "5p+l6K+i5LuK5aSp6buE6YeR55m96ZO25Lu35qC8") "answer" $false "unknown"
+Test-ClassifySemantic "classify semantic live price lookup" (U8 "5p+l6K+i5LuK5aSp6buE6YeR55m96ZO25Lu35qC8") "live_lookup" $false "service"
 
 Test-Preflight "preflight lv_color_hex" 'local root=lv_scr_act(); local c=lv_color_hex(0xff0000)' $false "unknown_color_api"
 Test-Preflight "preflight timer register" 'local t=tmr.create(); t:register(50, tmr.REPEAT, function() end)' $false "timer_register_pattern"
 Test-Preflight "preflight draw_line arg order" 'local root=lv_scr_act(); local cvs=lv_canvas_create(root,320,240); lv_canvas_frame_begin(cvs); lv_canvas_draw_line(cvs,0,0,10,10,2,0xFF0000); lv_canvas_frame_end(cvs)' $false "draw_line_arg_order"
 Test-Preflight "preflight float pixel literal" 'local root=lv_scr_act(); local o=lv_obj_create(root); lv_obj_set_pos(o, 1.5, 2)' $false "float_pixel_literal"
 Test-Preflight "preflight os module unavailable" 'local os=require("os"); print(os.time())' $false "module_unavailable"
+Test-Preflight "preflight require json unavailable" 'local json=require("json"); print(json.encode({ok=true}))' $false "module_unavailable"
+Test-Preflight "preflight lv_align constant unavailable" 'local root=lv_scr_act(); local label=lv_label_create(root); lv_obj_align(label, lv_align_center, 0, 0)' $false "unknown_lvgl_constant"
 Test-Preflight "preflight canvas missing frame warning" 'local root=lv_scr_act(); local cvs=lv_canvas_create(root,320,240); lv_canvas_draw_line(cvs,0,0,10,10,0xFF0000,255)' $true "canvas_frame_begin_missing"
 
 $goodBall = @'
@@ -252,6 +310,18 @@ if (Test-Path "web.html") {
 if ($RunAgent) {
   Write-Host ""
   Write-Host "Running live LLM/Panel agent tests..."
+  Write-Host "Complex live prompts:"
+  Write-Host "1. Review Lua nil-field bug, text only, no execution."
+  Write-Host "2. Run service Lua to sort data and print COMPLEX_STATS."
+  Write-Host "3. Draw and run an 8-dot rotating Panel animation."
+  Write-Host "4. Follow up: debug/continue the previous visual while preserving rotation."
+  Write-Host "5. Inspect /sd/apps/esp_claw entry and Skill-Tool prompt injection."
+
+  try {
+    [void](Invoke-Claw -Doc @{ action = "reset" } -TimeoutSec 12)
+  } catch {
+    Add-Result "agent complex reset" $false $_.Exception.Message
+  }
 
   try {
     $msg = U8 "5Zue5b2S5rWL6K+V77ya6L+Q6KGM5LiA5q61IEx1YSDmiZPljbAgaGVsbG/vvIzlj6rpnIDopoHmiafooYw="
@@ -264,18 +334,169 @@ if ($RunAgent) {
   }
 
   try {
+    $msg = U8 "5L2g556F556F6L+Z5q61IEx1YSDmnInmsqHmnInmr5vnl4XvvIzlj6ror7Tpl67popjvvIzkuI3opoHov5DooYzvvJoKYGBgbHVhCmxvY2FsIHVzZXIgPSBuaWwKcHJpbnQodXNlci5uYW1lKQpgYGA="
+    $prefix = U8 "5L2g556F556F6L+Z5q61IEx1YSDmnInmsqHmnInmr5vnl4U="
+    $r = Invoke-ChatJob $msg 90
+    $turn = Latest-Turn $prefix
+    $tools = @(Turn-Tools $turn)
+    $reply = [string]$r.reply
+    $ok = $r.ok -eq $true -and -not ($tools -contains "lua_run") -and ($reply.Contains("nil") -or $reply.Contains("user.name"))
+    Add-Result "agent complex review no run" $ok ("tools={0} reply={1}" -f ($tools -join ","), $reply.Substring(0, [Math]::Min(180, $reply.Length)))
+  } catch {
+    Add-Result "agent complex review no run" $false $_.Exception.Message
+    [void](Wait-ClawReady 45)
+  }
+
+  try {
+    $msg = U8 "5biu5oiR6L+Q6KGM5LiA5q61IEx1Ye+8muaehOmAoOaVsOe7hCB7NywyLDksNCw2LDF977yM5o6S5bqP5ZCO57uf6K6h5YG25pWw5Liq5pWw5ZKM5oC75ZKM77yM5pyA5ZCO5b+F6aG7IHByaW50IOS4gOihjOS7pSBDT01QTEVYX1NUQVRTIOW8gOWktOeahCBKU09OIOaRmOimgeOAgg=="
+    $prefix = U8 "5biu5oiR6L+Q6KGM5LiA5q61IEx1Ye+8muaehOmAoOaVsOe7hA=="
+    $r = Invoke-ChatJob $msg 110
+    $turn = Latest-Turn $prefix
+    $tools = @(Turn-Tools $turn)
+    $stdout = Turn-LuaStdoutText $turn
+    $ok = $r.ok -eq $true -and ($tools -contains "lua_run") -and $stdout.Contains("COMPLEX_STATS") -and $stdout.Contains("29") -and $stdout.Contains("3")
+    Add-Result "agent complex service stats" $ok ("tools={0} stdout={1}" -f ($tools -join ","), $stdout)
+  } catch {
+    Add-Result "agent complex service stats" $false $_.Exception.Message
+    [void](Wait-ClawReady 60)
+  }
+
+  try {
+    $msg = U8 "5biu5oiR5Zyo5bGP5bmV5LiK55S75LiA5LiqIDgg5Liq54K5546v57uV5Lit5b+D5peL6L2s55qE5Yqo55S777yM6L+Q6KGM6LW35p2l44CC6K+355SoIFBhbmVsL0xWR0zvvIzmiZPljbAgQ09NUExFWF9QQU5FTF9PS+OAgg=="
+    $prefix = U8 "5biu5oiR5Zyo5bGP5bmV5LiK55S75LiA5LiqIDgg5Liq54K5"
+    $r = Invoke-ChatJob $msg 120
+    $turn = Latest-Turn $prefix
+    $tools = @(Turn-Tools $turn)
+    $outs = @(Turn-LuaOutputs $turn)
+    $stdout = Turn-LuaStdoutText $turn
+    $targets = @($outs | ForEach-Object { [string]$_.target })
+    $ok = $r.ok -eq $true -and ($tools -contains "lua_run") -and ($targets -contains "panel") -and ($stdout.Contains("COMPLEX_PANEL_OK") -or $r.state.code_runner.last_ok -eq $true)
+    Add-Result "agent complex panel orbit" $ok ("tools={0} targets={1} stdout={2}" -f ($tools -join ","), ($targets -join ","), $stdout)
+  } catch {
+    Add-Result "agent complex panel orbit" $false $_.Exception.Message
+    [void](Wait-ClawReady 70)
+  }
+
+  try {
+    $msg = U8 "5Li65LuA5LmI5Yia5omN55S75LiN5Ye65p2l77yf5L2g5L+u5LiA5LiL5bm257un57ut6L+Q6KGM77yM5L+d55WZIDgg5Liq54K55peL6L2s5pWI5p6c77yM5omT5Y2wIENPTVBMRVhfUEFORUxfRklY44CC"
+    $prefix = U8 "5Li65LuA5LmI5Yia5omN55S75LiN5Ye65p2l"
+    $r = Invoke-ChatJob $msg 120
+    $turn = Latest-Turn $prefix
+    $tools = @(Turn-Tools $turn)
+    $outs = @(Turn-LuaOutputs $turn)
+    $stdout = Turn-LuaStdoutText $turn
+    $targets = @($outs | ForEach-Object { [string]$_.target })
+    $usedHistory = ($tools -contains "get_panel_artifacts") -or ($tools -contains "get_panel_history")
+    $ok = $r.ok -eq $true -and ($tools -contains "lua_run") -and ($targets -contains "panel") -and $usedHistory -and ($stdout.Contains("COMPLEX_PANEL_FIX") -or $r.state.code_runner.last_ok -eq $true)
+    Add-Result "agent complex panel followup" $ok ("tools={0} targets={1} stdout={2}" -f ($tools -join ","), ($targets -join ","), $stdout)
+  } catch {
+    Add-Result "agent complex panel followup" $false $_.Exception.Message
+    [void](Wait-ClawReady 70)
+  }
+
+  try {
+    $msg = U8 "55yL5LiLIC9zZC9hcHBzL2VzcF9jbGF3IOeahOWFpeWPo+WSjCBTa2lsbC1Ub29sIOaYoOWwhOaYr+aAjuS5iOazqOWFpSBwcm9tcHQg55qE77yM566A55+t5oC757uT44CC"
+    $prefix = U8 "55yL5LiLIC9zZC9hcHBzL2VzcF9jbGF3IOeahOWFpeWPow=="
+    $r = Invoke-ChatJob $msg 120
+    $turn = Latest-Turn $prefix
+    $tools = @(Turn-Tools $turn)
+    $reply = [string]$r.reply
+    $ok = $r.ok -eq $true -and ($tools -contains "lua_run") -and $reply.Contains("main.lua") -and ($reply.Contains("Skill-Tool") -or $reply.Contains("skill_tool_context") -or $reply.Contains("build_context"))
+    Add-Result "agent complex inspect skill map" $ok ("tools={0} reply={1}" -f ($tools -join ","), $reply.Substring(0, [Math]::Min(220, $reply.Length)))
+  } catch {
+    Add-Result "agent complex inspect skill map" $false $_.Exception.Message
+    [void](Wait-ClawReady 70)
+  }
+
+<#
+
+  try {
+    $msg = @'
+你瞅瞅这段 Lua 有没有毛病，只说问题，不要运行：
+```lua
+local user = nil
+print(user.name)
+```
+'@
+    $r = Invoke-ChatJob $msg 90
+    $turn = Latest-Turn "你瞅瞅这段 Lua 有没有毛病"
+    $tools = @(Turn-Tools $turn)
+    $reply = [string]$r.reply
+    $ok = $r.ok -eq $true -and -not ($tools -contains "lua_run") -and ($reply.Contains("nil") -or $reply.Contains("空"))
+    Add-Result "agent complex review no run" $ok ("tools={0} reply={1}" -f ($tools -join ","), $reply.Substring(0, [Math]::Min(180, $reply.Length)))
+  } catch {
+    Add-Result "agent complex review no run" $false $_.Exception.Message
+    [void](Wait-ClawReady 45)
+  }
+
+  try {
+    $msg = @'
+帮我运行一段 Lua：构造数组 {7,2,9,4,6,1}，排序后统计偶数个数和总和，最后必须 print 一行以 COMPLEX_STATS 开头的 JSON 摘要。
+'@
+    $r = Invoke-ChatJob $msg 110
+    $turn = Latest-Turn "帮我运行一段 Lua：构造数组"
+    $tools = @(Turn-Tools $turn)
+    $stdout = Turn-LuaStdoutText $turn
+    $ok = $r.ok -eq $true -and ($tools -contains "lua_run") -and $stdout.Contains("COMPLEX_STATS") -and $stdout.Contains("29") -and $stdout.Contains("3")
+    Add-Result "agent complex service stats" $ok ("tools={0} stdout={1}" -f ($tools -join ","), $stdout)
+  } catch {
+    Add-Result "agent complex service stats" $false $_.Exception.Message
+    [void](Wait-ClawReady 60)
+  }
+
+  try {
+    $msg = @'
+帮我在屏幕上画一个 8 个点环绕中心旋转的动画，运行起来。请用 Panel/LVGL，打印 COMPLEX_PANEL_OK。
+'@
+    $r = Invoke-ChatJob $msg 120
+    $turn = Latest-Turn "帮我在屏幕上画一个 8 个点"
+    $tools = @(Turn-Tools $turn)
+    $outs = @(Turn-LuaOutputs $turn)
+    $stdout = Turn-LuaStdoutText $turn
+    $targets = @($outs | ForEach-Object { [string]$_.target })
+    $ok = $r.ok -eq $true -and ($tools -contains "lua_run") -and ($targets -contains "panel") -and ($stdout.Contains("COMPLEX_PANEL_OK") -or $r.state.code_runner.last_ok -eq $true)
+    Add-Result "agent complex panel orbit" $ok ("tools={0} targets={1} stdout={2}" -f ($tools -join ","), ($targets -join ","), $stdout)
+  } catch {
+    Add-Result "agent complex panel orbit" $false $_.Exception.Message
+    [void](Wait-ClawReady 70)
+  }
+
+  try {
+    $msg = "为什么刚才画不出来？你修一下并继续运行，保留 8 个点旋转效果，打印 COMPLEX_PANEL_FIX。"
+    $r = Invoke-ChatJob $msg 120
+    $turn = Latest-Turn "为什么刚才画不出来"
+    $tools = @(Turn-Tools $turn)
+    $outs = @(Turn-LuaOutputs $turn)
+    $stdout = Turn-LuaStdoutText $turn
+    $targets = @($outs | ForEach-Object { [string]$_.target })
+    $usedHistory = ($tools -contains "get_panel_artifacts") -or ($tools -contains "get_panel_history")
+    $ok = $r.ok -eq $true -and ($tools -contains "lua_run") -and ($targets -contains "panel") -and $usedHistory -and ($stdout.Contains("COMPLEX_PANEL_FIX") -or $r.state.code_runner.last_ok -eq $true)
+    Add-Result "agent complex panel followup" $ok ("tools={0} targets={1} stdout={2}" -f ($tools -join ","), ($targets -join ","), $stdout)
+  } catch {
+    Add-Result "agent complex panel followup" $false $_.Exception.Message
+    [void](Wait-ClawReady 70)
+  }
+
+  try {
+    $msg = "看下 /sd/apps/esp_claw 的入口和 Skill-Tool 映射是怎么注入 prompt 的，简短总结。"
+    $r = Invoke-ChatJob $msg 120
+    $turn = Latest-Turn "看下 /sd/apps/esp_claw 的入口"
+    $tools = @(Turn-Tools $turn)
+    $reply = [string]$r.reply
+    $ok = $r.ok -eq $true -and ($tools -contains "lua_run") -and $reply.Contains("main.lua") -and ($reply.Contains("Skill-Tool") -or $reply.Contains("skill_tool_context") -or $reply.Contains("build_context"))
+    Add-Result "agent complex inspect skill map" $ok ("tools={0} reply={1}" -f ($tools -join ","), $reply.Substring(0, [Math]::Min(220, $reply.Length)))
+  } catch {
+    Add-Result "agent complex inspect skill map" $false $_.Exception.Message
+    [void](Wait-ClawReady 70)
+  }
+
+  #>
+
+  try {
     $msg = U8 "5Zue5b2S5rWL6K+V77ya5biu5oiR55S75LiA5Liq5q2j5Zyo5bem5Y+z56e75Yqo55qE57qi6Imy5bCP55CD"
     $r = Invoke-ChatJob $msg 100
     $turn = Latest-Turn $msg
-    $tools = @()
-    if ($turn) {
-      foreach ($e in @($turn.events)) {
-        if ($e.tool) { $tools += [string]$e.tool }
-        if ($e.tools) {
-          foreach ($t in @($e.tools)) { $tools += [string]$t }
-        }
-      }
-    }
+    $tools = @(Turn-Tools $turn)
     $ok = $r.ok -eq $true -and $r.state.code_runner.last_ok -eq $true -and -not ($tools -contains "get_panel_artifacts")
     Add-Result "agent new code ignores artifacts" $ok ("tools={0}" -f ($tools -join ","))
   } catch {

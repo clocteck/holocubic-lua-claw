@@ -25,6 +25,8 @@
   --red:#d92d20;
   --green:#16803c;
   --green-dim:rgba(22,128,60,.12);
+  --blue:#175cd3;
+  --blue-dim:rgba(23,92,211,.1);
   --shadow:0 16px 40px rgba(16,24,40,.08);
   --radius:10px;
   --radius-lg:16px;
@@ -75,6 +77,7 @@ input[type=checkbox]{width:22px;height:22px}
 label.inline{flex-direction:row;align-items:center;justify-content:space-between}
 .row{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}
 .pill{display:inline-flex;align-items:center;min-height:30px;padding:3px 9px;border-radius:999px;background:rgba(16,24,40,.04);border:1px solid var(--line);color:var(--muted);font-size:.8rem}
+.pill.info{background:var(--blue-dim);border-color:rgba(23,92,211,.24);color:var(--blue)}
 .qrbox{border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);padding:10px;display:flex;flex-direction:column;gap:9px}
 .qr-actions{display:flex;gap:8px;flex-wrap:wrap}
 .qr-actions button{min-height:36px;padding:0 10px}
@@ -582,6 +585,8 @@ function applyState(st){
   $("dot").className="dot "+((st.busy||jobBusy)?"busy":(st.last_error?"warn":""));
   $("llmReady").textContent=st.llm_ready?"LLM ready":"LLM missing";
   $("wechatReady").textContent=st.wechat&&st.wechat.enabled?(st.wechat.configured?"WeChat on":"WeChat token"):"WeChat off";
+  $("llmReady").className="pill "+(st.llm_ready?"info":"");
+  $("wechatReady").className="pill "+(st.wechat&&st.wechat.enabled&&st.wechat.configured?"info":"");
   $("toolCount").textContent="Tools "+(st.tool_count||0);
   if(st.wechat&&st.wechat.qr)setWechatQrText(st.wechat.qr);
   const logs=$("logs");

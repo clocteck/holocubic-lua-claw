@@ -147,6 +147,7 @@ local function list_skill_ids()
   return ids
 end
 
+-- 每次构造上下文时重新扫描目录，方便通过 DevTools 热更新或新增 Skill。
 local function load_catalog()
   local APP = M.APP
   local S = ensure_state()
@@ -196,6 +197,7 @@ local function recount_active()
   S.active = count
 end
 
+-- Skill 按会话激活：同一个 Web/微信会话里保留已激活文档和能力组。
 local function activate(skill_id, source)
   local APP = M.APP
   local core = APP.core
@@ -207,7 +209,8 @@ local function activate(skill_id, source)
   end
 
   local sess = get_session(source)
-  if not sess.map[skill.id] then
+  local already_active = sess.map[skill.id] == true
+  if not already_active then
     sess.ids[#sess.ids + 1] = skill.id
     sess.map[skill.id] = true
   end
@@ -215,7 +218,8 @@ local function activate(skill_id, source)
     sess.groups[skill.cap_groups[i]] = true
   end
   recount_active()
-  core.append_log("skill", "activate " .. skill.id)
+  skill.already_active = already_active
+  core.append_log("skill", already_active and ("already active " .. skill.id) or ("activate " .. skill.id))
   return true, skill
 end
 
@@ -263,11 +267,18 @@ local function active_docs_context(source)
   return core.trim(table.concat(parts, "\n"))
 end
 
+-- 把 Skill catalog、Skill-Tool 映射和已激活 Skill 文档拼进模型上下文。
 local function build_context(source)
   local parts = {}
   local catalog = catalog_context()
   if catalog ~= "" then
     parts[#parts + 1] = catalog
+  end
+  if M.APP.tools and M.APP.tools.skill_tool_context then
+    local ok, text = pcall(M.APP.tools.skill_tool_context, source)
+    if ok and type(text) == "string" and text ~= "" then
+      parts[#parts + 1] = text
+    end
   end
   local docs = active_docs_context(source)
   if docs ~= "" then

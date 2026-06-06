@@ -256,8 +256,66 @@ local function qr_cancel()
   return true, qr_snapshot(false)
 end
 
--- 向微信会话发送文本。
-local function send_text(chat_id, message)
+local function split_text_chunks(message, limit, max_chunks)
+  local APP = M.APP
+  local core = APP.core
+  message = core.text_or(message, "")
+  limit = tonumber(limit) or 1800
+  max_chunks = tonumber(max_chunks) or 4
+  if #message <= limit then
+    return { message }
+  end
+  local chunks = {}
+  local current = ""
+  local function push_current()
+    current = core.trim(current)
+    if current ~= "" then
+      chunks[#chunks + 1] = current
+      current = ""
+    end
+  end
+  for raw_line in message:gmatch("[^\r\n]+") do
+    local chunk_line = core.trim(raw_line)
+    if chunk_line ~= "" then
+      local next_text = current == "" and chunk_line or (current .. "\n" .. chunk_line)
+      if #next_text > limit then
+        push_current()
+        while #chunk_line > limit and #chunks < max_chunks do
+          local part = core.utf8_prefix(chunk_line, limit)
+          chunks[#chunks + 1] = part
+          chunk_line = chunk_line:sub(#part + 1)
+        end
+        current = chunk_line
+      else
+        current = next_text
+      end
+    end
+    if #chunks >= max_chunks then
+      break
+    end
+  end
+  if #chunks < max_chunks then
+    push_current()
+  end
+  if #chunks == 0 then
+    chunks[1] = core.short_text(message, limit)
+  end
+  if #chunks == max_chunks then
+    local joined = table.concat(chunks, "")
+    if #joined < #message then
+      chunks[max_chunks] = core.short_text(chunks[max_chunks], math.max(80, limit - 80)) .. "\n...(内容较长，已压缩)"
+    end
+  end
+  if #chunks > 1 then
+    for i = 1, #chunks do
+      chunks[i] = "(" .. tostring(i) .. "/" .. tostring(#chunks) .. ")\n" .. chunks[i]
+    end
+  end
+  return chunks
+end
+
+-- 向微信会话发送单条文本。
+local function send_text_one(chat_id, message)
   local APP = M.APP
   local core = APP.core
   if not APP.config.wechat_enabled or APP.config.wechat_token == "" then
@@ -295,6 +353,24 @@ local function send_text(chat_id, message)
   if not code or code < 200 or code >= 300 then
     return false, "wechat send http " .. tostring(code) .. ": " .. core.short_text(body, 160)
   end
+  return true, nil
+end
+
+-- 向微信会话发送文本；长回复按自然段拆成少量多段。
+local function send_text(chat_id, message)
+  local APP = M.APP
+  local core = APP.core
+  local chunks = split_text_chunks(message, 1800, 4)
+  for i = 1, #chunks do
+    local ok, err = send_text_one(chat_id, chunks[i])
+    if not ok then
+      return false, err
+    end
+    if i < #chunks and sys and sys.wait then
+      pcall(sys.wait, 120)
+    end
+  end
+  core.append_log("wechat", "sent text chunks=" .. tostring(#chunks))
   return true, nil
 end
 
