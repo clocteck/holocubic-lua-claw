@@ -1798,6 +1798,9 @@ local function tool_followup_input(user_text, tool_results, source, task_plan, f
     "Continue the same user request using these results.",
     "Decide whether the original request still requires execution. If it does, continue with tools; if it is complete, summarize the actual result.",
     "If a tool result contains stdout/data that answers the user's request, write the final user-facing answer now. Do not stop after progress text, and do not call more tools unless the requested information is clearly missing.",
+    "Result-present example: if status says brightness=80 and set_brightness returns ok level=30, answer '当前亮度是 80，已调到 30。' and end the turn.",
+    "Result-missing example: if a read, run, or setting call fails, times out, or returns no confirmed value, say the result is not confirmed and either continue with the next necessary tool or report the failure. Never write a success summary from a missing result.",
+    "After a final answer with an actual result, do not continue with apologies, summaries, or repeated confirmations unless the user asks another question.",
     "activate_skill only loads operating instructions; context/preflight/history tools do not complete the requested action by themselves.",
     "For Lua app, UI, HTTP, file, or device-code work, use code_runner tools; memory_ops is only for explicit long-term memory operations.",
     "If the current user request is a short style, variant, quantity, or refinement, infer the pending visual/code task from Recent conversation and execute the updated version.",
@@ -1882,6 +1885,10 @@ local function tool_summary_input(user_text, tool_results, source, task_plan)
     "If stdout contains the requested marker or data, include it concisely in the answer.",
     "If an earlier tool call failed but a later tool call succeeded, say it was repaired instead of claiming there were no failures.",
     "Do not offer to rerun, continue, or wait for confirmation after the requested work is already complete.",
+    "End after the final result. One concise sentence is enough for simple device actions; do not add apologies, repeated confirmations, or promises about future behavior.",
+    "Result-present example: '当前亮度是 80，已调到 30。'",
+    "Result-missing example: '没有拿到确认结果，亮度是否已调整还不能确认。'",
+    "If the outputs show only queued, timeout, ok=false, or no requested data, use the result-missing pattern rather than a success pattern.",
   }
   if type(source) == "table" and source.channel == "wechat" then
     parts[#parts + 1] = "This answer will be sent to WeChat. Be concise and natural. Use short paragraphs if details are needed; do not paste raw stdout or long code."
@@ -2088,6 +2095,8 @@ local function response_instructions(source)
     "For code tasks, keep reasoning concise and proceed to the necessary tool call promptly.",
     "For multi-step work, make the visible process feel interactive: give short user-facing progress notes and final action summaries. Do not reveal hidden chain-of-thought; summarize observable steps, decisions, and results.",
     "When you call tools for a user-visible task, include one short user-facing progress sentence before the tool call when the API supports assistant text plus tool calls. Say what you understood and what you are about to verify or run; do not present it as the final result.",
+    "Completion boundary: after tools return enough evidence and you have written the final user-facing result, stop this turn. Do not add extra apologies, recaps, repeated confirmations, or 'next time' promises unless the latest user explicitly asks for them.",
+    "No-result boundary: if a required tool returns no usable result, an error, a timeout, or only an unconfirmed queued state, do not imply success. Continue with a needed tool if one is available; otherwise state concisely that no confirmed result was obtained.",
     "Never delete directories or broad paths such as /sd. For a single file delete, ask for explicit confirmation first and do not delete in the same turn.",
     "Summaries of tool work must be grounded in tool arguments and outputs; queued/timeouts are not confirmed success.",
     "Current configured underlying LLM model: " .. core.text_or(M.APP.config.llm_model, "unknown"),
@@ -2620,6 +2629,8 @@ local function completion_self_review(user_text, candidate_text, tool_results, s
     "Require continuation only when requested facts/actions are missing, unsupported, contradicted, or the answer defers after the work should already be complete.",
     "Do not demand more detail just because more detail is possible.",
     "For tool-backed answers, claimed facts must appear in tool outputs or known observations.",
+    "A concise final answer with the requested confirmed result is complete even if it does not apologize, recap history, or mention future behavior.",
+    "If the required result is missing, failed, timed out, or unconfirmed, a success-style answer is incomplete; prefer rewrite to a concise no-confirmed-result answer when no further tool can help.",
     "For live lookup, web_probe is only reachability/status evidence. Page contents, lists, prices, model specs, and article facts require web_fetch, lookup_context items, or another content-bearing tool result.",
     "Skill activation, status checks, directory listings, and preflight checks are not enough when the user asked for concrete file contents, code changes, or fetched page contents.",
     "For code/run tasks, the answer should mention the observed success/error and repair path when relevant.",
